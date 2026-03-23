@@ -175,4 +175,16 @@ app.get("/", (req, res) => res.json({ status: "APEX TRADE bot online", paper: PA
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`APEX TRADE server on port ${PORT} | ${PAPER ? "PAPER MODE" : "LIVE MODE"}`);
+
+  // Keep alive — ping self every 14 minutes so Render never sleeps
+  setInterval(async () => {
+    try {
+      await fetch(`https://apextrade-bot.onrender.com/`);
+      console.log("Keep-alive ping sent");
+    } catch (e) {
+      console.log("Keep-alive ping failed:", e.message);
+    }
+  }, 14 * 60 * 1000);
 });
+
+  
