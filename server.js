@@ -153,7 +153,7 @@ app.get("/status", async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.post("/bot/start", (req, res) => {
+app.all("/bot/start", (req, res) => {
   if (botRunning) return res.json({ ok: true, message: "Already running" });
   botRunning = true;
   botInterval = setInterval(botTick, 60000);
@@ -161,7 +161,7 @@ app.post("/bot/start", (req, res) => {
   res.json({ ok: true, message: "Bot started" });
 });
 
-app.post("/bot/stop", (req, res) => {
+app.all("/bot/stop", (req, res) => {
   botRunning = false;
   if (botInterval) { clearInterval(botInterval); botInterval = null; }
   res.json({ ok: true, message: "Bot stopped" });
