@@ -10,7 +10,7 @@ const PAPER = process.env.PAPER_TRADING !== "false";
 const BASE = PAPER ? "https://paper-api.alpaca.markets" : "https://api.alpaca.markets";
 const DATA = "https://data.alpaca.markets";
 const LOSS = parseFloat(process.env.DAILY_LOSS_LIMIT || "-200");
-const WL = ["SPY","NVDA","AAPL","MSFT","QQQ"];
+const WL = ["SPY","NVDA","AAPL","MSFT","QQQ","TSLA","AMZN","GOOGL","META"];
 const HDR = {"APCA-API-KEY-ID":KEY,"APCA-API-SECRET-KEY":SECRET};
 
 let running=false, pnl=0, trades=[], sigs=[], prices={}, hist={}, timer=null;
