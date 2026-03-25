@@ -68,7 +68,7 @@ const price = prices[symbol];
 if (!price) continue;
 const signal = getMomentumSignal(symbol);
 if (!signal) continue;
-signals.push({ symbol, …signal, price, time: new Date().toLocaleTimeString() });
+signals.push({ symbol, ...signal, price, time: new Date().toLocaleTimeString() });
 if (signal.confidence < 75) continue;
 const hasPos = !!posMap[symbol];
 if (signal.type === “BUY” && !hasPos) {
