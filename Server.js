@@ -1,0 +1,14 @@
+const express = require("express");
+const path = require("path");
+const app = express();
+app.use(express.static(__dirname));
+app.get("/ping", (req, res) => res.json({ ok: true }));
+app.get("/status", (req, res) => res.json({ botRunning: false, paper: true, equity: 0, cash: 0, dailyPnL: 0, positions: [] }));
+app.all("/bot/start", (req, res) => res.json({ ok: true, message: "Bot started" }));
+app.all("/bot/stop", (req, res) => res.json({ ok: true, message: "Bot stopped" }));
+app.get("/trades", (req, res) => res.json({ trades: [] }));
+app.get("/signals", (req, res) => res.json({ signals: [] }));
+app.get("/prices", (req, res) => res.json({ prices: {} }));
+app.get("/", (req, res) => res.sendFile(path.join(__dirname, "index.html")));
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log("running on " + PORT));
