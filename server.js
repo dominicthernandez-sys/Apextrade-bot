@@ -97,5 +97,6 @@ app.get("/",function(req,res){res.sendFile(path.join(__dirname,"index.html"));})
 var PORT=process.env.PORT||3000;
 app.listen(PORT,function(){
   console.log("APEX TRADE port "+PORT+" PAPER="+PAPER);
-  setInterval(function(){fetch("https://apextrade-bot.onrender.com/ping").catch(function(){});},840000);
+ setInterval(function(){fetch("https://apextrade-bot.onrender.com/ping").catch(function(){});},600000);
+ setInterval(function(){if(!running){running=true;timer=setInterval(tick,60000);tick();console.log("Auto-restarted bot");}},3600000); 
 });
