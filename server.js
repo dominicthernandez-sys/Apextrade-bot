@@ -20,8 +20,8 @@ function post(url,b){return fetch(url,{method:"POST",headers:Object.assign({"Con
 
 function signal(sym){
   var h=hist[sym];
-  if(!h||h.length<20)return null;
-  var ma=h.slice(-20).reduce(function(a,b){return a+b;},0)/20;
+  if(!h||h.length<10)return null;
+  var ma=h.slice(-10).reduce(function(a,b){return a+b;},0)/20;
   var c=h[h.length-1];
   var p=((c-ma)/ma)*100;
   if(p>0.5)return{type:"BUY",confidence:Math.min(99,Math.round(60+p*8)),reason:p.toFixed(2)+"% above MA20"};
@@ -53,7 +53,7 @@ async function tick(){
       var sig=signal(sym);
       if(!sig)continue;
       sigs.push({symbol:sym,type:sig.type,confidence:sig.confidence,reason:sig.reason,price:price,time:new Date().toLocaleTimeString()});
-      if(sig.confidence<75)continue;
+      if(sig.confidence<65)continue;
       if(sig.type==="BUY"&&!posMap[sym]){
         var acct=await get(BASE+"/v2/account");
         var qty=Math.max(1,Math.floor((parseFloat(acct.equity||0)*0.02)/(price*0.02)));
