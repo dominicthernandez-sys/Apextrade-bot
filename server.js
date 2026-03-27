@@ -59,7 +59,7 @@ async function tick(){
         var ord=await post(BASE+"/v2/orders",{symbol:sym,qty:qty,side:"buy",type:"market",time_in_force:"day"});       
         if(ord.id){await post(BASE+"/v2/orders",{symbol:sym,qty:qty,side:"sell",type:"stop",stop_price:stopPrice,time_in_force:"gtc"});}
         var totalExposure=Object.keys(posMap).reduce(function(sum,s){return sum+parseFloat(posMap[s].market_value||0);},0);
-        var maxExposure=parseFloat(acct.equity||0)*0.10;
+        var maxExposure=parseFloat(acct.equity||0)*(sig.confidence>=90?0.25:0.10);
         if(totalExposure>=maxExposure)continue;
         var remainingBudget=maxExposure-totalExposure;
         var qty=Math.max(1,Math.floor(remainingBudget/price));
