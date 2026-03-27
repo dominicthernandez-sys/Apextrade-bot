@@ -56,7 +56,8 @@ async function tick(){
       if(sig.confidence<65)continue;
       if(sig.type==="BUY"&&!posMap[sym]&&Object.keys(posMap).length<4){
         var acct=await get(BASE+"/v2/account");
-        var qty=Math.max(1,Math.floor((parseFloat(acct.equity||0)*0.02)/(price*0.02)));
+        var maxSpend=parseFloat(acct.equity||0)*0.05;
+        var qty=Math.max(1,Math.floor(maxSpend/price));
         var ord=await post(BASE+"/v2/orders",{symbol:sym,qty:qty,side:"buy",type:"market",time_in_force:"day"});
         if(ord.id){trades.unshift({id:ord.id,symbol:sym,side:"BUY",qty:qty,price:price,pnl:null,time:new Date().toLocaleTimeString(),strategy:"Momentum MA20"});if(trades.length>50)trades.pop();}
       }
