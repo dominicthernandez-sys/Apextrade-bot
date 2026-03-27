@@ -54,7 +54,7 @@ async function tick(){
       if(!sig)continue;
       sigs.push({symbol:sym,type:sig.type,confidence:sig.confidence,reason:sig.reason,price:price,time:new Date().toLocaleTimeString()});
       if(sig.confidence<65)continue;
-      if(sig.type==="BUY"&&!posMap[sym]){
+      if(sig.type==="BUY"&&!posMap[sym]&&Object.keys(posMap).length<4){
         var acct=await get(BASE+"/v2/account");
         var qty=Math.max(1,Math.floor((parseFloat(acct.equity||0)*0.02)/(price*0.02)));
         var ord=await post(BASE+"/v2/orders",{symbol:sym,qty:qty,side:"buy",type:"market",time_in_force:"day"});
