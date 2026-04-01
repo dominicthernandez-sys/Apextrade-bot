@@ -4,6 +4,25 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>APEX TRADE</title>
+<script>
+if(window.location.hash==="#pusher"){
+document.addEventListener("DOMContentLoaded",function(){
+document.body.innerHTML='<div style="padding:20px;font-family:monospace;background:#0d1117;min-height:100vh;color:#e8f0fe"><h2 style="color:#00d4ff">GitHub Pusher</h2><button onclick="doPush()" style="width:100%;padding:14px;background:#00d4ff;color:#000;border:none;border-radius:8px;font-size:16px;font-weight:bold;cursor:pointer;margin-top:20px">Push server.js</button><div id="r" style="margin-top:16px;padding:12px;border-radius:8px;display:none"></div></div>';
+});
+window.doPush=async function(){
+var r=document.getElementById("r");
+r.style.display="block";
+r.textContent="Pushing...";
+try{
+var code=await fetch("/server-code").then(function(x){return x.text();});
+var resp=await fetch("https://api.github.com/repos/dominicthernandez-sys/Apextrade-bot/contents/server.js",{method:"PUT",headers:{"Authorization":"token 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","Content-Type":"application/json"},body:JSON.stringify({message:"Update server.js",content:btoa(unescape(encodeURIComponent(code))),sha:"d2c61527efffbf7c7a8c432d4cd8353d5037c4f8"})});
+var d=await resp.json();
+if(d.commit){r.style.background="#00e67620";r.style.color="#00e676";r.style.border="1px solid #00e676";r.textContent="SUCCESS! "+d.commit.sha.slice(0,7);}
+else{r.style.background="#ff174420";r.style.color="#ff1744";r.style.border="1px solid #ff1744";r.textContent="ERROR: "+d.message;}
+}catch(e){r.textContent="ERROR: "+e.message;}
+};
+}
+</script>
 <style>
 body{margin:0;background:#080b10;color:#e8f0fe;font-family:monospace;max-width:480px;margin:0 auto;}
 .header{background:#0d1117;padding:14px 16px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #1f2d40;}
