@@ -66,11 +66,23 @@ async function tick(){
         var ord=await post(BASE+"/v2/orders",{symbol:sym,qty:qty,side:"buy",type:"market",time_in_force:"day"});
         if(ord.id){trades.unshift({id:ord.id,symbol:sym,side:"BUY",qty:qty,price:price,pnl:null,time:new Date().toLocaleTimeString(),strategy:"Momentum MA20"});if(trades.length>50)trades.pop();}
       }
-      if(sig.type==="SELL"&&posMap[sym]){
+      if(posMap[sym]){
         var pos=posMap[sym];
         var sq=Math.abs(parseInt(pos.qty));
-        var so=await post(BASE+"/v2/orders",{symbol:sym,qty:sq,side:"sell",type:"market",time_in_force:"day"});
-        if(so.id){var sp=parseFloat(pos.unrealized_pl||0);pnl+=sp;trades.unshift({id:so.id,symbol:sym,side:"SELL",qty:sq,price:price,pnl:sp,time:new Date().toLocaleTimeString(),strategy:"Momentum MA20"});if(trades.length>50)trades.pop();}
+        var entryPrice=parseFloat(pos.avg_entry_price||price);
+        var gainPct=((price-entryPrice)/entryPrice)*100;
+        var daysHeld=Math.floor((Date.now()-new Date(pos.created_at||Date.now()).getTime())/86400000);
+        var shouldSell=false;
+        var sellQty=sq;
+        var reason="";
+        if(gainPct>=35){shouldSell=true;sellQty=sq;reason="35% profit target";}
+        else if(gainPct>=20){shouldSell=true;sellQty=Math.floor(sq/2);reason="20% partial profit";}
+        else if(gainPct<=-15){shouldSell=true;sellQty=sq;reason="15% stop loss";}
+        else if(daysHeld>=5&&gainPct<5){shouldSell=true;sellQty=sq;reason="5 day time limit";}
+        else if(sig.type==="SELL"&&gainPct<0){shouldSell=true;sellQty=sq;reason="momentum sell";}
+        if(shouldSell&&sellQty>0){
+          var so=await post(BASE+"/v2/orders",{symbol:sym,qty:sellQty,side:"sell",type:"market",time_in_force:"day"});
+          if(so.id){var sp=parseFloat(pos.unrealized_pl||0)*(sellQty/sq);pnl+=sp;trades.unshift({id:so.id,symbol:sym,side:"SELL",qty:sellQty,price:price,pnl:sp,time:new Date().toLocaleTimeString(),strategy:reason});if(trades.length>50)trades.pop();}
       }
     }
   }catch(e){console.error(e.message);}
