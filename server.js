@@ -67,8 +67,10 @@ async function tick(){
         var sell=false;
         var sq2=sq;
         var why="";
-        if(gp>=35){sell=true;sq2=sq;why="35pct profit";}
-        else if(gp>=20){sell=true;sq2=Math.floor(sq/2);why="20pct partial";}
+   var third=Math.floor(sq/3);
+        if(gp>=35&&sq>0){sell=true;sq2=sq;why="35pct final exit";}
+        else if(gp>=20&&sq>Math.floor(sq/3)){sell=true;sq2=third;why="20pct scale out 2/3";}
+        else if(gp>=10&&sq===Math.floor(sq)){sell=true;sq2=third;why="10pct scale out 1/3";}
         else if(gp<=-15){sell=true;sq2=sq;why="15pct stoploss";}
         else if(dh>=5&&gp<5){sell=true;sq2=sq;why="5day limit";}
         else if(s.type==="SELL"&&gp<0){sell=true;sq2=sq;why="momentum sell";}
