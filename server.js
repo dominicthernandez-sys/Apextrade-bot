@@ -33,15 +33,20 @@ async function tick(){
   if(!running)return;
   if(pnl<=LOSS){running=false;clearInterval(timer);return;}
   try{
-    var bars=await dget("/v2/stocks/bars/latest?symbols="+WL.join(",")+"&feed=iex");
-    if(bars.bars){
-      Object.keys(bars.bars).forEach(function(s){
-        prices[s]=bars.bars[s].c;
-        if(!hist[s])hist[s]=[];
-        hist[s].push(bars.bars[s].c);
-        if(hist[s].length>50)hist[s].shift();
-      });
-    }
+    var snap=await dget("/v2/stocks/snapshots?symbols="+WL.join(",")+"&feed=iex");
+    if(snap){
+      Object.keys(snap).forEach(function(s){
+        var q=snap[s]&&snap[s].latestTrade;
+        if(q&&q.p){
+          prices[s]=q.p;
+          if(!hist[s])hist[s]=[];
+          if(!hist[s].length||hist[s][hist[s].length-1]!==q.p){
+            hist[s].push(q.p);
+            if(hist[s].length>50)hist[s].shift();
+         }
+      }
+    });
+   }
     var posArr=await aget("/v2/positions");
     var posMap={};
     if(Array.isArray(posArr))posArr.forEach(function(p){posMap[p.symbol]=p;});
