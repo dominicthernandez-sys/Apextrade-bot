@@ -90,12 +90,18 @@ async function tick(){
         var max=eq*(s.confidence>=90?0.25:0.10);
         if(tot>=max)continue;
         var rem=max-tot;
-        var qty=Math.max(1,Math.floor(rem/price));
+        var chunk=s.confidence>=85?3:s.confidence>=75?2:1;
+        var qty=Math.max(1,Math.floor((rem/3)/price));
+        if(qty<1)continue;
+        var alreadyIn=posMap[sym]?parseFloat(posMap[sym].market_value||0):0;
+        var maxChunkVal=(max/3)*chunk;
+        if(alreadyIn>=maxChunkVal)continue;
         var sp2=parseFloat((price*0.85).toFixed(2));
         var ord=await apost("/v2/orders",{symbol:sym,qty:qty,side:"buy",type:"market",time_in_force:"day"});
         if(ord.id){
           await apost("/v2/orders",{symbol:sym,qty:qty,side:"sell",type:"stop",stop_price:sp2,time_in_force:"gtc"});
-          trades.unshift({id:ord.id,symbol:sym,side:"BUY",qty:qty,price:price,pnl:null,time:new Date().toLocaleTimeString(),strategy:"Momentum MA10"});
+          var label=chunk===1?"Entry 1/3":chunk===2?"Entry 2/3":"Entry 3/3";
+          trades.unshift({id:ord.id,symbol:sym,side:"BUY",qty:qty,price:price,pnl:null,time:new Date().toLocaleTimeString(),strategy:label});
           if(trades.length>50)trades.pop();
         }
       }
