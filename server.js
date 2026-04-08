@@ -22,6 +22,8 @@ let hist = {};
 let timer = null;
 let entryCount = {};
 let exitCount = {};
+let lastTick = Date.now();
+let tickCount = 0;
 
 function aget(u){return fetch(BASE+u,{headers:HDR}).then(function(r){return r.json();});}
 function apost(u,b){return fetch(BASE+u,{method:"POST",headers:Object.assign({"Content-Type":"application/json"},HDR),body:JSON.stringify(b)}).then(function(r){return r.json();});}
@@ -41,6 +43,8 @@ function getSig(sym){
 async function tick(){
   if(!running)return;
   if(pnl<=LOSS){running=false;clearInterval(timer);console.log("Loss limit hit");return;}
+  lastTick=Date.now();
+  tickCount++;
   try{
     var snap=await dget("/v2/stocks/snapshots?symbols="+WL.join(",")+"&feed=iex");
     if(snap){
@@ -128,10 +132,29 @@ async function tick(){
         }
       }
     }
-  }catch(e){console.error("Tick error:",e.message);}
+  }catch(e){
+    console.error("Tick error:",e.message);
+  }
 }
 
-app.get("/ping",function(req,res){res.json({ok:true});});
+function startBot(){
+  running=true;
+  if(timer){clearInterval(timer);}
+  timer=setInterval(tick,10000);
+  tick();
+  console.log("Bot started - ticks:"+tickCount);
+}
+
+function stopBot(){
+  running=false;
+  if(timer){clearInterval(timer);timer=null;}
+  console.log("Bot stopped");
+}
+
+app.get("/ping",function(req,res){
+  if(running&&!timer){startBot();}
+  res.json({ok:true,running:running,lastTick:lastTick,tickCount:tickCount});
+});
 
 app.get("/status",async function(req,res){
   try{
@@ -141,22 +164,8 @@ app.get("/status",async function(req,res){
   }catch(e){res.status(500).json({error:e.message});}
 });
 
-app.all("/bot/start",function(req,res){
-  running=true;
-  if(timer){clearInterval(timer);}
-  timer=setInterval(tick,10000);
-  tick();
-  console.log("Bot started");
-  res.json({ok:true,botRunning:true});
-});
-
-app.all("/bot/stop",function(req,res){
-  running=false;
-  if(timer){clearInterval(timer);timer=null;}
-  console.log("Bot stopped");
-  res.json({ok:true,botRunning:false});
-});
-
+app.all("/bot/start",function(req,res){startBot();res.json({ok:true,botRunning:true});});
+app.all("/bot/stop",function(req,res){stopBot();res.json({ok:true,botRunning:false});});
 app.get("/trades",function(req,res){res.json({trades:trades});});
 app.get("/signals",function(req,res){res.json({signals:sigs});});
 app.get("/prices",function(req,res){res.json({prices:prices});});
@@ -165,10 +174,27 @@ app.get("/",function(req,res){res.sendFile(path.join(__dirname,"index.html"));})
 var PORT=process.env.PORT||3000;
 app.listen(PORT,function(){
   console.log("APEX TRADE port "+PORT+" | "+(PAPER?"PAPER":"LIVE"));
-  timer=setInterval(tick,10000);
-  tick();
-  setInterval(function(){fetch("https://apextrade-bot.onrender.com/ping").catch(function(){});},600000);
+  startBot();
+
+  // Ping every 30 seconds - keeps alive AND self-heals
   setInterval(function(){
-    if(!running){running=true;if(timer){clearInterval(timer);}timer=setInterval(tick,10000);tick();console.log("Auto-restarted");}
-  },3600000);
+    fetch("https://apextrade-bot.onrender.com/ping")
+      .then(function(r){return r.json();})
+      .then(function(d){
+        if(!d.running){
+          console.log("Ping detected bot down - restarting");
+          startBot();
+        }
+      })
+      .catch(function(e){console.log("Ping failed:"+e.message);});
+  },30000);
+
+  // Watchdog every 2 minutes
+  setInterval(function(){
+    var secsSinceLastTick=(Date.now()-lastTick)/1000;
+    if(running&&secsSinceLastTick>60){
+      console.log("Watchdog: no tick in "+secsSinceLastTick+"s - restarting");
+      startBot();
+    }
+  },120000);
 });
