@@ -12,7 +12,7 @@ var DATA="https://data.alpaca.markets";
 var LOSS=parseFloat(process.env.DAILY_LOSS_LIMIT||"-200");
 var WL=["SPY","NVDA","AAPL","MSFT","QQQ","TSLA","AMZN","GOOGL","META","COIN","MSTR","AMD","PLTR","RIVN","SOFI","MARA","HOOD"];
 var HDR={"APCA-API-KEY-ID":KEY,"APCA-API-SECRET-KEY":SECRET};
-var running=false,pnl=0,trades=[],sigs=[],prices={},hist={},timer=null;
+var running=false,pnl=0,trades=[],sigs=[],prices={},hist={},timer=null,entryCount={},exitCount={};
 
 function aget(u){return fetch(BASE+u,{headers:HDR}).then(function(r){return r.json();});}
 function apost(u,b){return fetch(BASE+u,{method:"POST",headers:Object.assign({"Content-Type":"application/json"},HDR),body:JSON.stringify(b)}).then(function(r){return r.json();});}
