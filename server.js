@@ -112,6 +112,7 @@ async function tick(){
         if(!entryCount[sym])entryCount[sym]=0;
         var maxEntry=sig.confidence>=85?3:sig.confidence>=75?2:1;
         if(entryCount[sym]>=maxEntry)continue;
+        if(posMap[sym])continue;
         var acct=await aget("/v2/account");
         var eq=parseFloat(acct.equity||0);
         var tot=Object.keys(posMap).reduce(function(sum,k){return sum+parseFloat(posMap[k].market_value||0);},0);
