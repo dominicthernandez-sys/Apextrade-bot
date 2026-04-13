@@ -19,6 +19,7 @@ let trades = [];
 let sigs = [];
 let prices = {};
 let hist = {};
+let volumes = {};
 let timer = null;
 let entryCount = {};
 let exitCount = {};
@@ -29,14 +30,48 @@ function aget(u){return fetch(BASE+u,{headers:HDR}).then(function(r){return r.js
 function apost(u,b){return fetch(BASE+u,{method:"POST",headers:Object.assign({"Content-Type":"application/json"},HDR),body:JSON.stringify(b)}).then(function(r){return r.json();});}
 function dget(u){return fetch(DATA+u,{headers:HDR}).then(function(r){return r.json();});}
 
+function calcRSI(arr){
+  if(arr.length<14)return 50;
+  var gains=0,losses=0;
+  for(var i=arr.length-14;i<arr.length;i++){
+    var diff=arr[i]-(arr[i-1]||arr[i]);
+    if(diff>0)gains+=diff;
+    else losses+=Math.abs(diff);
+  }
+  var rs=gains/(losses||1);
+  return 100-(100/(1+rs));
+}
+
+function avgVol(arr){
+  if(!arr||arr.length<2)return 0;
+  return arr.reduce(function(a,b){return a+b;},0)/arr.length;
+}
+
 function getSig(sym){
   var h=hist[sym];
-  if(!h||h.length<10)return null;
-  var ma=h.slice(-10).reduce(function(a,b){return a+b;},0)/10;
-  var c=h[h.length-1];
-  var p=((c-ma)/ma)*100;
-  if(p>0.3)return{type:"BUY",confidence:Math.min(99,Math.round(60+p*8)),reason:p.toFixed(2)+"% above MA10"};
-  if(p<-0.3)return{type:"SELL",confidence:Math.min(99,Math.round(60+Math.abs(p)*8)),reason:Math.abs(p).toFixed(2)+"% below MA10"};
+  if(!h||h.length<15)return null;
+  var cur=h[h.length-1];
+  var ma10=h.slice(-10).reduce(function(a,b){return a+b;},0)/10;
+  var ma50=h.slice(-Math.min(50,h.length)).reduce(function(a,b){return a+b;},0)/Math.min(50,h.length);
+  var rsi=calcRSI(h);
+  var vols=volumes[sym]||[];
+  var av=avgVol(vols.slice(0,-1));
+  var cv=vols[vols.length-1]||0;
+  var volOk=av===0||cv>=av;
+  var pct=((cur-ma10)/ma10)*100;
+  var uptrend=cur>ma50;
+  var downtrend=cur<ma50;
+
+  if(pct>0.2&&uptrend&&rsi<70&&volOk){
+    var conf=Math.min(99,Math.round(60+pct*8));
+    if(rsi<50)conf=Math.min(99,conf+5);
+    if(cv>av*1.5)conf=Math.min(99,conf+5);
+    return{type:"BUY",confidence:conf,reason:pct.toFixed(2)+"% above MA10 | RSI:"+Math.round(rsi),rsi:rsi};
+  }
+  if(pct<-0.2&&downtrend&&rsi>30&&volOk){
+    var conf2=Math.min(99,Math.round(60+Math.abs(pct)*8));
+    return{type:"SELL",confidence:conf2,reason:Math.abs(pct).toFixed(2)+"% below MA10 | RSI:"+Math.round(rsi),rsi:rsi};
+  }
   return null;
 }
 
@@ -51,13 +86,13 @@ async function tick(){
       Object.keys(snap).forEach(function(s){
         var d=snap[s];
         var p=d&&d.latestTrade&&d.latestTrade.p||d&&d.minuteBar&&d.minuteBar.c||d&&d.dailyBar&&d.dailyBar.c;
+        var v=d&&d.minuteBar&&d.minuteBar.v||0;
         if(p){
           prices[s]=p;
           if(!hist[s])hist[s]=[];
-          if(!hist[s].length||hist[s][hist[s].length-1]!==p){
-            hist[s].push(p);
-            if(hist[s].length>50)hist[s].shift();
-          }
+          if(!hist[s].length||hist[s][hist[s].length-1]!==p){hist[s].push(p);if(hist[s].length>100)hist[s].shift();}
+          if(!volumes[s])volumes[s]=[];
+          if(v>0){volumes[s].push(v);if(volumes[s].length>50)volumes[s].shift();}
         }
       });
     }
@@ -65,10 +100,7 @@ async function tick(){
     var posArr=await aget("/v2/positions");
     var posMap={};
     if(Array.isArray(posArr))posArr.forEach(function(p){posMap[p.symbol]=p;});
-
-    Object.keys(entryCount).forEach(function(sym){
-      if(!posMap[sym]){entryCount[sym]=0;exitCount[sym]=0;}
-    });
+    Object.keys(entryCount).forEach(function(sym){if(!posMap[sym]){entryCount[sym]=0;exitCount[sym]=0;}});
 
     sigs=[];
     for(var i=0;i<WL.length;i++){
@@ -77,7 +109,7 @@ async function tick(){
       if(!price)continue;
       var sig=getSig(sym);
       if(!sig)continue;
-      sigs.push({symbol:sym,type:sig.type,confidence:sig.confidence,reason:sig.reason,price:price,time:new Date().toLocaleTimeString()});
+      sigs.push({symbol:sym,type:sig.type,confidence:sig.confidence,reason:sig.reason,rsi:Math.round(sig.rsi),price:price,time:new Date().toLocaleTimeString()});
 
       if(posMap[sym]){
         var pos=posMap[sym];
@@ -109,10 +141,10 @@ async function tick(){
       }
 
       if(sig.type==="BUY"&&sig.confidence>=65){
+        if(posMap[sym])continue;
         if(!entryCount[sym])entryCount[sym]=0;
         var maxEntry=sig.confidence>=85?3:sig.confidence>=75?2:1;
         if(entryCount[sym]>=maxEntry)continue;
-        if(posMap[sym])continue;
         var acct=await aget("/v2/account");
         var eq=parseFloat(acct.equity||0);
         var tot=Object.keys(posMap).reduce(function(sum,k){return sum+parseFloat(posMap[k].market_value||0);},0);
@@ -129,13 +161,11 @@ async function tick(){
           var label="Entry "+entryCount[sym]+"/3";
           trades.unshift({id:ord.id,symbol:sym,side:"BUY",qty:qty,price:price,pnl:null,time:new Date().toLocaleTimeString(),strategy:label});
           if(trades.length>50)trades.pop();
-          console.log("BUY "+sym+" "+label+" qty:"+qty+" conf:"+sig.confidence+"%");
+          console.log("BUY "+sym+" "+label+" RSI:"+Math.round(sig.rsi)+" conf:"+sig.confidence+"%");
         }
       }
     }
-  }catch(e){
-    console.error("Tick error:",e.message);
-  }
+  }catch(e){console.error("Tick error:",e.message);}
 }
 
 function startBot(){
@@ -143,7 +173,7 @@ function startBot(){
   if(timer){clearInterval(timer);}
   timer=setInterval(tick,10000);
   tick();
-  console.log("Bot started - ticks:"+tickCount);
+  console.log("Bot started");
 }
 
 function stopBot(){
@@ -176,26 +206,14 @@ var PORT=process.env.PORT||3000;
 app.listen(PORT,function(){
   console.log("APEX TRADE port "+PORT+" | "+(PAPER?"PAPER":"LIVE"));
   startBot();
-
-  // Ping every 30 seconds - keeps alive AND self-heals
   setInterval(function(){
     fetch("https://apextrade-bot.onrender.com/ping")
       .then(function(r){return r.json();})
-      .then(function(d){
-        if(!d.running){
-          console.log("Ping detected bot down - restarting");
-          startBot();
-        }
-      })
+      .then(function(d){if(!d.running){startBot();}})
       .catch(function(e){console.log("Ping failed:"+e.message);});
   },30000);
-
-  // Watchdog every 2 minutes
   setInterval(function(){
-    var secsSinceLastTick=(Date.now()-lastTick)/1000;
-    if(running&&secsSinceLastTick>60){
-      console.log("Watchdog: no tick in "+secsSinceLastTick+"s - restarting");
-      startBot();
-    }
+    var secs=(Date.now()-lastTick)/1000;
+    if(running&&secs>60){console.log("Watchdog restart");startBot();}
   },120000);
 });
