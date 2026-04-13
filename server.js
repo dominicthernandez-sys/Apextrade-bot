@@ -23,6 +23,7 @@ let volumes = {};
 let timer = null;
 let entryCount = {};
 let exitCount = {};
+let entryConf = {};
 let lastTick = Date.now();
 let tickCount = 0;
 
@@ -38,8 +39,7 @@ function calcRSI(arr){
     if(diff>0)gains+=diff;
     else losses+=Math.abs(diff);
   }
-  var rs=gains/(losses||1);
-  return 100-(100/(1+rs));
+  return 100-(100/(1+(gains/(losses||1))));
 }
 
 function avgVol(arr){
@@ -59,16 +59,14 @@ function getSig(sym){
   var cv=vols[vols.length-1]||0;
   var volOk=av===0||cv>=av;
   var pct=((cur-ma10)/ma10)*100;
-  var uptrend=cur>ma50;
-  var downtrend=cur<ma50;
 
-  if(pct>0.2&&uptrend&&rsi<70&&volOk){
+  if(pct>0.2&&cur>ma50&&rsi<70&&volOk){
     var conf=Math.min(99,Math.round(60+pct*8));
     if(rsi<50)conf=Math.min(99,conf+5);
     if(cv>av*1.5)conf=Math.min(99,conf+5);
     return{type:"BUY",confidence:conf,reason:pct.toFixed(2)+"% above MA10 | RSI:"+Math.round(rsi),rsi:rsi};
   }
-  if(pct<-0.2&&downtrend&&rsi>30&&volOk){
+  if(pct<-0.2&&cur<ma50&&rsi>30&&volOk){
     var conf2=Math.min(99,Math.round(60+Math.abs(pct)*8));
     return{type:"SELL",confidence:conf2,reason:Math.abs(pct).toFixed(2)+"% below MA10 | RSI:"+Math.round(rsi),rsi:rsi};
   }
@@ -100,7 +98,7 @@ async function tick(){
     var posArr=await aget("/v2/positions");
     var posMap={};
     if(Array.isArray(posArr))posArr.forEach(function(p){posMap[p.symbol]=p;});
-    Object.keys(entryCount).forEach(function(sym){if(!posMap[sym]){entryCount[sym]=0;exitCount[sym]=0;}});
+    Object.keys(entryCount).forEach(function(sym){if(!posMap[sym]){entryCount[sym]=0;exitCount[sym]=0;entryConf[sym]=0;}});
 
     sigs=[];
     for(var i=0;i<WL.length;i++){
@@ -111,17 +109,29 @@ async function tick(){
       if(!sig)continue;
       sigs.push({symbol:sym,type:sig.type,confidence:sig.confidence,reason:sig.reason,rsi:Math.round(sig.rsi),price:price,time:new Date().toLocaleTimeString()});
 
+      // EXIT LOGIC
       if(posMap[sym]){
         var pos=posMap[sym];
         var sq=Math.abs(parseInt(pos.qty));
         var ep=parseFloat(pos.avg_entry_price||price);
         var gp=((price-ep)/ep)*100;
+        var unrealized=parseFloat(pos.unrealized_pl||0);
         var dh=Math.floor((Date.now()-new Date(pos.created_at||Date.now()).getTime())/86400000);
         if(!exitCount[sym])exitCount[sym]=0;
+        var conf=entryConf[sym]||65;
         var third=Math.max(1,Math.floor(sq/3));
         var sell=false,sellQty=sq,why="";
 
-        if(gp<=-15){sell=true;sellQty=sq;why="15pct stoploss";entryCount[sym]=0;exitCount[sym]=0;}
+        // Dollar profit quick exits based on entry confidence
+        if(unrealized>=100&&conf<75&&exitCount[sym]<1){
+          sell=true;sellQty=sq;why="$100 quick win";entryCount[sym]=0;exitCount[sym]=0;
+        } else if(unrealized>=150&&conf<85&&exitCount[sym]<1){
+          sell=true;sellQty=sq;why="$150 quick win";entryCount[sym]=0;exitCount[sym]=0;
+        } else if(unrealized>=200&&conf<90&&exitCount[sym]<1){
+          sell=true;sellQty=sq;why="$200 quick win";entryCount[sym]=0;exitCount[sym]=0;
+        }
+        // Percentage scale outs for high confidence trades
+        else if(gp<=-15){sell=true;sellQty=sq;why="15pct stoploss";entryCount[sym]=0;exitCount[sym]=0;}
         else if(gp>=35&&exitCount[sym]<3){sell=true;sellQty=sq;why="35pct final exit";entryCount[sym]=0;exitCount[sym]=0;}
         else if(gp>=20&&exitCount[sym]<2){sell=true;sellQty=third;why="20pct scale out 2/3";exitCount[sym]=2;}
         else if(gp>=10&&exitCount[sym]<1){sell=true;sellQty=third;why="10pct scale out 1/3";exitCount[sym]=1;}
@@ -131,15 +141,17 @@ async function tick(){
         if(sell&&sellQty>0){
           var so=await apost("/v2/orders",{symbol:sym,qty:sellQty,side:"sell",type:"market",time_in_force:"day"});
           if(so.id){
-            var sp=parseFloat(pos.unrealized_pl||0)*(sellQty/sq);
+            var sp=unrealized*(sellQty/sq);
             pnl+=sp;
             trades.unshift({id:so.id,symbol:sym,side:"SELL",qty:sellQty,price:price,pnl:sp,time:new Date().toLocaleTimeString(),strategy:why});
             if(trades.length>50)trades.pop();
+            console.log("SELL "+sym+" "+why+" pnl:$"+sp.toFixed(2));
           }
         }
         continue;
       }
 
+      // ENTRY LOGIC
       if(sig.type==="BUY"&&sig.confidence>=65){
         if(posMap[sym])continue;
         if(!entryCount[sym])entryCount[sym]=0;
@@ -158,6 +170,7 @@ async function tick(){
         if(ord.id){
           await apost("/v2/orders",{symbol:sym,qty:qty,side:"sell",type:"stop",stop_price:stopPrice,time_in_force:"gtc"});
           entryCount[sym]++;
+          entryConf[sym]=sig.confidence;
           var label="Entry "+entryCount[sym]+"/3";
           trades.unshift({id:ord.id,symbol:sym,side:"BUY",qty:qty,price:price,pnl:null,time:new Date().toLocaleTimeString(),strategy:label});
           if(trades.length>50)trades.pop();
