@@ -113,7 +113,7 @@ function overview(){
   if(ERR) h+='<div style="background:#ff174420;border:1px solid #ff1744;border-radius:10px;padding:12px;margin-bottom:12px;color:#ff1744;font-size:12px">Cannot reach bot. Tap Refresh.</div>';
   h+='<div class="hero">';
   h+='<div style="font-size:10px;color:#4a6080;letter-spacing:2px">TODAY P&L - '+(S&&S.paper===false?"LIVE":"PAPER")+'</div>';
-  h+='<div style="font-size:42px;font-weight:bold;color:'+pc+'">'+(pnl>=0?"+":"")+"$"+Math.abs(pnl).toFixed(2)+'</div>';
+  h+='<div style="font-size:42px;font-weight:bold;color:'+pc+'">'+(pnl>=0?"+":"-")+"$"+Math.abs(pnl).toFixed(2)+'</div>';
   h+='<div style="color:#7a9ab8;font-size:12px;margin-top:6px">Equity $'+Math.round(eq)+' &nbsp; Cash $'+Math.round(cash)+'</div>';
   h+='<div><span class="badge" style="background:'+(bot?"#00e67620":"#ff174420")+';color:'+(bot?"#00e676":"#ff1744")+';border:1px solid '+(bot?"#00e676":"#ff1744")+'">'+(bot?"BOT ACTIVE":"BOT PAUSED")+'</span></div>';
   h+='<button class="'+(bot?"stopbtn":"startbtn")+'" onclick="'+(bot?"stopBot":"startBot")+'()">'+(bot?"Pause Bot":"Start Bot")+'</button>';
