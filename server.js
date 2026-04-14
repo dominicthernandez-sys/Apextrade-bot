@@ -1,3 +1,4 @@
+cat > /mnt/user-data/outputs/server.js << 'EOF'
 const express = require("express");
 const path = require("path");
 const app = express();
@@ -12,6 +13,77 @@ const DATA = "https://data.alpaca.markets";
 const LOSS = parseFloat(process.env.DAILY_LOSS_LIMIT || "-200");
 const WL = ["SPY","NVDA","AAPL","MSFT","QQQ","TSLA","AMZN","GOOGL","META","COIN","MSTR","AMD","PLTR","RIVN","SOFI","MARA","HOOD","SOUN","IONQ","RGTI","QUBT","SMCI","ARM","AVGO","MU","CVNA","UBER","LYFT","DASH"];
 const HDR = {"APCA-API-KEY-ID":KEY,"APCA-API-SECRET-KEY":SECRET};
+
+// Database setup
+const Database = require("better-sqlite3");
+const db = new Database("./trades.db");
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS trades (
+    id TEXT PRIMARY KEY,
+    symbol TEXT,
+    side TEXT,
+    qty INTEGER,
+    price REAL,
+    pnl REAL,
+    time TEXT,
+    date TEXT,
+    strategy TEXT,
+    created_at INTEGER
+  );
+`);
+
+const insertTrade = db.prepare(`
+  INSERT OR IGNORE INTO trades (id, symbol, side, qty, price, pnl, time, date, strategy, created_at)
+  VALUES (@id, @symbol, @side, @qty, @price, @pnl, @time, @date, @strategy, @created_at)
+`);
+
+function saveTrade(trade){
+  try{
+    var d=new Date();
+    var date=d.toLocaleDateString("en-US",{timeZone:"America/New_York"});
+    insertTrade.run({
+      id: trade.id||("manual-"+Date.now()),
+      symbol: trade.symbol,
+      side: trade.side,
+      qty: trade.qty||0,
+      price: trade.price||0,
+      pnl: trade.pnl||0,
+      time: trade.time||"",
+      date: date,
+      strategy: trade.strategy||"",
+      created_at: Date.now()
+    });
+  }catch(e){console.error("DB save error:",e.message);}
+}
+
+function getTradesDB(period){
+  try{
+    var d=new Date();
+    if(period==="today"){
+      var today=d.toLocaleDateString("en-US",{timeZone:"America/New_York"});
+      return db.prepare("SELECT * FROM trades WHERE date=? ORDER BY created_at DESC LIMIT 100").all(today);
+    } else if(period==="week"){
+      var weekAgo=Date.now()-(7*24*60*60*1000);
+      return db.prepare("SELECT * FROM trades WHERE created_at>? ORDER BY created_at DESC LIMIT 200").all(weekAgo);
+    } else if(period==="month"){
+      var monthAgo=Date.now()-(30*24*60*60*1000);
+      return db.prepare("SELECT * FROM trades WHERE created_at>? ORDER BY created_at DESC LIMIT 500").all(monthAgo);
+    } else {
+      return db.prepare("SELECT * FROM trades ORDER BY created_at DESC LIMIT 500").all();
+    }
+  }catch(e){console.error("DB read error:",e.message);return [];}
+}
+
+function getPnLDB(period){
+  try{
+    var rows=getTradesDB(period);
+    var total=rows.filter(function(r){return r.side==="SELL";}).reduce(function(a,r){return a+(r.pnl||0);},0);
+    var wins=rows.filter(function(r){return r.side==="SELL"&&r.pnl>0;}).length;
+    var losses=rows.filter(function(r){return r.side==="SELL"&&r.pnl<0;}).length;
+    return{total:total,wins:wins,losses:losses,trades:rows.length};
+  }catch(e){return{total:0,wins:0,losses:0,trades:0};}
+}
 
 let running = true;
 let pnl = 0;
@@ -137,8 +209,9 @@ async function tick(){
           if(so.id){
             var sp=unrealized*(sellQty/sq);
             pnl+=sp;
-            trades.unshift({id:so.id,symbol:sym,side:"SELL",qty:sellQty,price:price,pnl:sp,time:now(),strategy:why});
-            if(trades.length>50)trades.pop();
+            var t={id:so.id,symbol:sym,side:"SELL",qty:sellQty,price:price,pnl:sp,time:now(),strategy:why};
+            trades.unshift(t);if(trades.length>50)trades.pop();
+            saveTrade(t);
             console.log("SELL "+sym+" "+why+" pnl:$"+sp.toFixed(2));
           }
         }
@@ -165,8 +238,9 @@ async function tick(){
           entryCount[sym]++;
           entryConf[sym]=sig.confidence;
           var label="Entry "+entryCount[sym]+"/3";
-          trades.unshift({id:ord.id,symbol:sym,side:"BUY",qty:qty,price:price,pnl:null,time:now(),strategy:label});
-          if(trades.length>50)trades.pop();
+          var bt={id:ord.id,symbol:sym,side:"BUY",qty:qty,price:price,pnl:null,time:now(),strategy:label};
+          trades.unshift(bt);if(trades.length>50)trades.pop();
+          saveTrade(bt);
           console.log("BUY "+sym+" "+label+" RSI:"+Math.round(sig.rsi)+" conf:"+sig.confidence+"%");
         }
       }
@@ -197,8 +271,16 @@ app.get("/status",async function(req,res){
   try{
     var a=await aget("/v2/account");
     var p=await aget("/v2/positions");
-    res.json({botRunning:running,paper:PAPER,equity:parseFloat(a.equity||0),cash:parseFloat(a.cash||0),dailyPnL:pnl,positions:Array.isArray(p)?p.map(function(x){return{symbol:x.symbol,qty:x.qty,pnl:parseFloat(x.unrealized_pl||0),value:parseFloat(x.market_value||0)};}) :[]});
+    var todayPnL=getPnLDB("today");
+    res.json({botRunning:running,paper:PAPER,equity:parseFloat(a.equity||0),cash:parseFloat(a.cash||0),dailyPnL:todayPnL.total,positions:Array.isArray(p)?p.map(function(x){return{symbol:x.symbol,qty:x.qty,pnl:parseFloat(x.unrealized_pl||0),value:parseFloat(x.market_value||0)};}) :[]});
   }catch(e){res.status(500).json({error:e.message});}
+});
+
+app.get("/pnl",function(req,res){
+  var today=getPnLDB("today");
+  var week=getPnLDB("week");
+  var month=getPnLDB("month");
+  res.json({today:today,week:week,month:month});
 });
 
 app.post("/sell/all",async function(req,res){
@@ -213,8 +295,9 @@ app.post("/sell/all",async function(req,res){
       if(ord.id){
         var sp=parseFloat(p.unrealized_pl||0);
         pnl+=sp;
-        trades.unshift({id:ord.id,symbol:p.symbol,side:"SELL",qty:qty,price:parseFloat(p.current_price||0),pnl:sp,time:now(),strategy:"Manual sell all"});
-        if(trades.length>50)trades.pop();
+        var t={id:ord.id,symbol:p.symbol,side:"SELL",qty:qty,price:parseFloat(p.current_price||0),pnl:sp,time:now(),strategy:"Manual sell all"};
+        trades.unshift(t);if(trades.length>50)trades.pop();
+        saveTrade(t);
         entryCount[p.symbol]=0;exitCount[p.symbol]=0;
         results.push(p.symbol);
       }
@@ -229,14 +312,15 @@ app.post("/sell/:sym",async function(req,res){
     var posArr=await aget("/v2/positions");
     if(!Array.isArray(posArr))return res.json({ok:false,error:"No positions found"});
     var pos=posArr.find(function(p){return p.symbol===sym;});
-    if(!pos)return res.json({ok:false,error:sym+" not found in positions"});
+    if(!pos)return res.json({ok:false,error:sym+" not found"});
     var qty=Math.abs(parseInt(pos.qty));
     var ord=await apost("/v2/orders",{symbol:sym,qty:qty,side:"sell",type:"market",time_in_force:"day"});
     if(ord.id){
       var sp=parseFloat(pos.unrealized_pl||0);
       pnl+=sp;
-      trades.unshift({id:ord.id,symbol:sym,side:"SELL",qty:qty,price:parseFloat(pos.current_price||0),pnl:sp,time:now(),strategy:"Manual sell"});
-      if(trades.length>50)trades.pop();
+      var t={id:ord.id,symbol:sym,side:"SELL",qty:qty,price:parseFloat(pos.current_price||0),pnl:sp,time:now(),strategy:"Manual sell"};
+      trades.unshift(t);if(trades.length>50)trades.pop();
+      saveTrade(t);
       entryCount[sym]=0;exitCount[sym]=0;
       res.json({ok:true,orderId:ord.id});
     } else {
@@ -247,7 +331,13 @@ app.post("/sell/:sym",async function(req,res){
 
 app.all("/bot/start",function(req,res){startBot();res.json({ok:true,botRunning:true});});
 app.all("/bot/stop",function(req,res){stopBot();res.json({ok:true,botRunning:false});});
-app.get("/trades",function(req,res){res.json({trades:trades});});
+
+app.get("/trades",function(req,res){
+  var period=req.query.period||"today";
+  var dbTrades=getTradesDB(period);
+  res.json({trades:dbTrades});
+});
+
 app.get("/signals",function(req,res){res.json({signals:sigs});});
 app.get("/prices",function(req,res){res.json({prices:prices});});
 app.get("/",function(req,res){res.sendFile(path.join(__dirname,"index.html"));});
@@ -267,3 +357,5 @@ app.listen(PORT,function(){
     if(running&&secs>60){console.log("Watchdog restart");startBot();}
   },120000);
 });
+EOF
+echo "done"
