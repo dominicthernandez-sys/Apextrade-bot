@@ -253,9 +253,9 @@ async function tick(){
         var sell=false,sellQty=sq,why="";
 
         // Quick dollar wins
-        if(unrealized>=100&&conf<75){sell=true;sellQty=sq;why="$100 quick win";entryCount[sym]=0;exitCount[sym]=0;}
-        else if(unrealized>=150&&conf<85){sell=true;sellQty=sq;why="$150 quick win";entryCount[sym]=0;exitCount[sym]=0;}
-        else if(unrealized>=200&&conf<90){sell=true;sellQty=sq;why="$200 quick win";entryCount[sym]=0;exitCount[sym]=0;}
+        if(unrealized>=50){sell=true;sellQty=third;why="$50 scale out";exitCount[sym]=1;}
+        else if(unrealized>=100){sell=true;sellQty=third;why="$100 scale out";exitCount[sym]=2;}
+        else if(unrealized>=200){sell=true;sellQty=sq;why="$200 full exit";entryCount[sym]=0;exitCount[sym]=0;}
         // Strategy-specific exits
         else if(sig.type==="SELL"&&sig.strategy===entryConf[sym+"_strat"]&&gp>0){sell=true;sellQty=sq;why=sig.strategy+" target exit";entryCount[sym]=0;exitCount[sym]=0;}
         // Percentage targets
