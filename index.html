@@ -9,9 +9,10 @@ body{margin:0;background:#080b10;color:#e8f0fe;font-family:monospace;max-width:4
 .header{background:#0d1117;padding:14px 16px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #1f2d40;position:sticky;top:0;z-index:50;}
 .logo{color:#00d4ff;font-size:18px;font-weight:bold;}
 .btn{background:transparent;border:1px solid #1f2d40;color:#e8f0fe;padding:6px 12px;border-radius:8px;cursor:pointer;font-family:monospace;font-size:12px;}
-.page{padding:14px;padding-bottom:80px;}
+.page{padding:14px;padding-bottom:88px;}
 .hero{background:#111827;border:1px solid #1f2d40;border-radius:16px;padding:24px;text-align:center;margin-bottom:14px;}
 .grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px;}
+.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:14px;}
 .card{background:#111827;border:1px solid #1f2d40;border-radius:12px;padding:14px;}
 .label{font-size:10px;color:#4a6080;margin-bottom:4px;}
 .val{font-size:22px;font-weight:bold;}
@@ -26,6 +27,9 @@ body{margin:0;background:#080b10;color:#e8f0fe;font-family:monospace;max-width:4
 .dot{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:6px;}
 .sellbtn{background:transparent;border:1px solid #ff1744;color:#ff1744;border-radius:8px;padding:5px 12px;font-size:10px;font-weight:700;cursor:pointer;font-family:monospace;flex-shrink:0;}
 .sellallbtn{background:transparent;border:1px solid #ff1744;color:#ff1744;border-radius:8px;padding:4px 12px;font-size:10px;font-weight:700;cursor:pointer;font-family:monospace;}
+.period-tabs{display:flex;gap:8px;margin-bottom:12px;}
+.ptab{background:transparent;border:1px solid #1f2d40;color:#4a6080;border-radius:8px;padding:6px 14px;font-size:11px;font-weight:700;cursor:pointer;font-family:monospace;}
+.ptab.on{border-color:#00d4ff;color:#00d4ff;}
 </style>
 </head>
 <body>
@@ -48,7 +52,7 @@ body{margin:0;background:#080b10;color:#e8f0fe;font-family:monospace;max-width:4
 </div>
 
 <script>
-var T=0, S=null, PR={}, TR=[], SG=[], ERR=false;
+var T=0, S=null, PR={}, TR=[], SG=[], PNL=null, ERR=false, PERIOD="today";
 var WL=["SPY","NVDA","AAPL","MSFT","QQQ","TSLA","AMZN","GOOGL","META","COIN","MSTR","AMD","PLTR","RIVN","SOFI","MARA","HOOD","SOUN","IONQ","RGTI","QUBT","SMCI","ARM","AVGO","MU","CVNA","UBER","LYFT","DASH"];
 
 function tab(n){
@@ -64,10 +68,11 @@ function fetchAll(){
   Promise.all([
     fetch("/status").then(function(r){return r.json();}),
     fetch("/prices").then(function(r){return r.json();}),
-    fetch("/trades").then(function(r){return r.json();}),
-    fetch("/signals").then(function(r){return r.json();})
+    fetch("/trades?period="+PERIOD).then(function(r){return r.json();}),
+    fetch("/signals").then(function(r){return r.json();}),
+    fetch("/pnl").then(function(r){return r.json();})
   ]).then(function(d){
-    S=d[0]; PR=d[1].prices||{}; TR=d[2].trades||[]; SG=d[3].signals||[];
+    S=d[0]; PR=d[1].prices||{}; TR=d[2].trades||[]; SG=d[3].signals||[]; PNL=d[4];
     ERR=false;
     var dot=document.getElementById("statusDot");
     var txt=document.getElementById("statusTxt");
@@ -83,6 +88,11 @@ function fetchAll(){
   });
 }
 
+function fetchTrades(){
+  fetch("/trades?period="+PERIOD).then(function(r){return r.json();}).then(function(d){TR=d.trades||[];draw();});
+}
+
+function setPeriod(p){PERIOD=p;fetchTrades();}
 function startBot(){fetch("/bot/start").then(function(r){return r.json();}).then(function(){fetchAll();});}
 function stopBot(){fetch("/bot/stop").then(function(r){return r.json();}).then(function(){fetchAll();});}
 
@@ -91,8 +101,8 @@ function sellOne(sym){
   fetch("/sell/"+sym,{method:"POST"})
     .then(function(r){return r.json();})
     .then(function(d){
-      if(d.ok){alert(sym+" sell order placed!");fetchAll();}
-      else{alert("Error: "+d.error);}
+      if(d.ok){alert(sym+" sold!");fetchAll();}
+      else{alert("Error: "+(d.error||"unknown"));}
     }).catch(function(){alert("Could not reach bot");});
 }
 
@@ -102,7 +112,7 @@ function sellAll(){
     .then(function(r){return r.json();})
     .then(function(d){
       if(d.ok){alert("All positions sold!");fetchAll();}
-      else{alert("Error: "+d.error);}
+      else{alert("Error: "+(d.error||"unknown"));}
     }).catch(function(){alert("Could not reach bot");});
 }
 
@@ -117,24 +127,36 @@ function overview(){
   var bot=S&&S.botRunning;
   var eq=S?S.equity:0;
   var cash=S?S.cash:0;
-  var pnl=S?S.dailyPnL:0;
+  var todayPnl=PNL?PNL.today.total:0;
   var pos=S?S.positions||[]:[];
-  var pc=pnl>=0?"#00e676":"#ff1744";
+  var pc=todayPnl>=0?"#00e676":"#ff1744";
   var h="";
-  if(ERR) h+='<div style="background:#ff174420;border:1px solid #ff1744;border-radius:10px;padding:12px;margin-bottom:12px;color:#ff1744;font-size:12px">Cannot reach bot. Tap Refresh.</div>';
+  if(ERR)h+='<div style="background:#ff174420;border:1px solid #ff1744;border-radius:10px;padding:12px;margin-bottom:12px;color:#ff1744;font-size:12px">Cannot reach bot. Tap Refresh.</div>';
+
   h+='<div class="hero">';
   h+='<div style="font-size:10px;color:#4a6080;letter-spacing:2px">TODAY P&L - '+(S&&S.paper===false?"LIVE":"PAPER")+'</div>';
-  h+='<div style="font-size:42px;font-weight:bold;color:'+pc+'">'+(pnl>=0?"+":"")+"$"+Math.abs(pnl).toFixed(2)+'</div>';
+  h+='<div style="font-size:42px;font-weight:bold;color:'+pc+'">'+(todayPnl>=0?"+":"")+"$"+Math.abs(todayPnl).toFixed(2)+'</div>';
   h+='<div style="color:#7a9ab8;font-size:12px;margin-top:6px">Equity $'+Math.round(eq)+' &nbsp; Cash $'+Math.round(cash)+'</div>';
   h+='<div><span class="badge" style="background:'+(bot?"#00e67620":"#ff174420")+';color:'+(bot?"#00e676":"#ff1744")+';border:1px solid '+(bot?"#00e676":"#ff1744")+'">'+(bot?"BOT ACTIVE":"BOT PAUSED")+'</span></div>';
   h+='<button class="'+(bot?"stopbtn":"startbtn")+'" onclick="'+(bot?"stopBot":"startBot")+'()">'+(bot?"Pause Bot":"Start Bot")+'</button>';
   h+='</div>';
+
+  // P&L summary cards
+  if(PNL){
+    h+='<div class="grid3">';
+    h+='<div class="card" style="text-align:center"><div class="label">TODAY</div><div style="font-size:18px;font-weight:bold;color:'+(PNL.today.total>=0?"#00e676":"#ff1744")+'">'+(PNL.today.total>=0?"+":"")+"$"+Math.abs(PNL.today.total).toFixed(0)+'</div><div style="font-size:10px;color:#4a6080">'+PNL.today.wins+'W/'+PNL.today.losses+'L</div></div>';
+    h+='<div class="card" style="text-align:center"><div class="label">THIS WEEK</div><div style="font-size:18px;font-weight:bold;color:'+(PNL.week.total>=0?"#00e676":"#ff1744")+'">'+(PNL.week.total>=0?"+":"")+"$"+Math.abs(PNL.week.total).toFixed(0)+'</div><div style="font-size:10px;color:#4a6080">'+PNL.week.wins+'W/'+PNL.week.losses+'L</div></div>';
+    h+='<div class="card" style="text-align:center"><div class="label">THIS MONTH</div><div style="font-size:18px;font-weight:bold;color:'+(PNL.month.total>=0?"#00e676":"#ff1744")+'">'+(PNL.month.total>=0?"+":"")+"$"+Math.abs(PNL.month.total).toFixed(0)+'</div><div style="font-size:10px;color:#4a6080">'+PNL.month.wins+'W/'+PNL.month.losses+'L</div></div>';
+    h+='</div>';
+  }
+
   h+='<div class="grid">';
   h+='<div class="card"><div class="label">EQUITY</div><div class="val" style="color:#00d4ff">$'+Math.round(eq)+'</div></div>';
   h+='<div class="card"><div class="label">CASH</div><div class="val" style="color:#00e676">$'+Math.round(cash)+'</div></div>';
   h+='<div class="card"><div class="label">POSITIONS</div><div class="val" style="color:#ffd740">'+pos.length+'</div></div>';
   h+='<div class="card"><div class="label">MODE</div><div class="val" style="color:#7a9ab8">'+(S&&S.paper===false?"LIVE":"PAPER")+'</div></div>';
   h+='</div>';
+
   if(pos.length>0){
     h+='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">';
     h+='<div style="font-size:10px;color:#4a6080">OPEN POSITIONS</div>';
@@ -149,6 +171,7 @@ function overview(){
       h+='</div>';
     }
   }
+
   h+='<div style="font-size:10px;color:#4a6080;margin-bottom:8px;margin-top:4px">WATCHLIST</div>';
   for(var j=0;j<WL.length;j++){
     var sym=WL[j];
@@ -182,16 +205,28 @@ function signalsPage(){
 }
 
 function tradesPage(){
-  var total=0;
-  for(var i=0;i<TR.length;i++) total+=TR[i].pnl||0;
-  var wins=0;
-  for(var j=0;j<TR.length;j++) if((TR[j].pnl||0)>0) wins++;
-  var h='<div class="card" style="display:flex;justify-content:space-between;margin-bottom:14px">';
-  h+='<div><div class="label">REALIZED P&L</div><div class="val" style="color:'+(total>=0?"#00e676":"#ff1744")+'">'+(total>=0?"+":"")+"$"+Math.abs(total).toFixed(2)+'</div></div>';
-  h+='<div style="text-align:right"><div class="label">WIN/LOSS</div><div class="val"><span style="color:#00e676">'+wins+'</span>/<span style="color:#ff1744">'+(TR.length-wins)+'</span></div></div>';
+  var h='';
+  // Period selector
+  h+='<div class="period-tabs">';
+  h+='<button class="ptab'+(PERIOD=="today"?" on":"")+'" onclick="setPeriod(\'today\')">Today</button>';
+  h+='<button class="ptab'+(PERIOD=="week"?" on":"")+'" onclick="setPeriod(\'week\')">Week</button>';
+  h+='<button class="ptab'+(PERIOD=="month"?" on":"")+'" onclick="setPeriod(\'month\')">Month</button>';
+  h+='<button class="ptab'+(PERIOD=="all"?" on":"")+'" onclick="setPeriod(\'all\')">All</button>';
   h+='</div>';
+
+  // P&L summary for selected period
+  if(PNL){
+    var pd=PERIOD=="week"?PNL.week:PERIOD=="month"?PNL.month:PNL.today;
+    if(PERIOD=="all"){pd={total:PNL.month.total,wins:PNL.month.wins,losses:PNL.month.losses};}
+    var wr=pd.wins+pd.losses>0?Math.round((pd.wins/(pd.wins+pd.losses))*100):0;
+    h+='<div class="card" style="display:flex;justify-content:space-between;margin-bottom:14px">';
+    h+='<div><div class="label">REALIZED P&L</div><div class="val" style="color:'+(pd.total>=0?"#00e676":"#ff1744")+'">'+(pd.total>=0?"+":"")+"$"+Math.abs(pd.total).toFixed(2)+'</div></div>';
+    h+='<div style="text-align:right"><div class="label">WIN RATE</div><div class="val" style="color:#ffd740">'+wr+'%</div><div style="font-size:10px;color:#4a6080">'+pd.wins+'W / '+pd.losses+'L</div></div>';
+    h+='</div>';
+  }
+
   if(TR.length==0){
-    h+='<div class="empty">No trades yet.<br>Start the bot and trades appear here.</div>';
+    h+='<div class="empty">No trades for this period.</div>';
   } else {
     for(var k=0;k<TR.length;k++){
       var t=TR[k];
