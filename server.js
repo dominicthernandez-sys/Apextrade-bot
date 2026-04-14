@@ -1,4 +1,3 @@
-cat > /mnt/user-data/outputs/server.js << 'EOF'
 const express = require("express");
 const path = require("path");
 const app = express();
@@ -357,5 +356,3 @@ app.listen(PORT,function(){
     if(running&&secs>60){console.log("Watchdog restart");startBot();}
   },120000);
 });
-EOF
-echo "done"
