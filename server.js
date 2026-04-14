@@ -335,6 +335,36 @@ app.get("/signals",function(req,res){res.json({signals:sigs});});
 app.get("/prices",function(req,res){res.json({prices:prices});});
 app.all("/bot/start",function(req,res){startBot();res.json({ok:true,botRunning:true});});
 app.all("/bot/stop",function(req,res){stopBot();res.json({ok:true,botRunning:false});});
+
+app.post("/sell/:sym",async function(req,res){
+  try{
+    var sym=req.params.sym.toUpperCase();
+    var posArr=await aget("/v2/positions");
+    if(!Array.isArray(posArr))return res.json({ok:false,error:"No positions found"});
+    var pos=posArr.find(function(p){return p.symbol===sym;});
+    if(!pos)return res.json({ok:false,error:sym+" not found in positions"});
+    var qty=Math.abs(parseInt(pos.qty));
+    var ord=await apost("/v2/orders",{symbol:sym,qty:qty,side:"sell",type:"market",time_in_force:"day"});
+    if(ord.id){entryCount[sym]=0;exitCount[sym]=0;res.json({ok:true,orderId:ord.id});}
+    else res.json({ok:false,error:JSON.stringify(ord)});
+  }catch(e){res.status(500).json({ok:false,error:e.message});}
+});
+
+app.post("/sell/all",async function(req,res){
+  try{
+    var posArr=await aget("/v2/positions");
+    if(!Array.isArray(posArr)||posArr.length===0)return res.json({ok:true,message:"No positions to sell"});
+    var results=[];
+    for(var i=0;i<posArr.length;i++){
+      var p=posArr[i];
+      var qty=Math.abs(parseInt(p.qty));
+      var ord=await apost("/v2/orders",{symbol:p.symbol,qty:qty,side:"sell",type:"market",time_in_force:"day"});
+      if(ord.id){entryCount[p.symbol]=0;exitCount[p.symbol]=0;results.push(p.symbol);}
+    }
+    res.json({ok:true,sold:results});
+  }catch(e){res.status(500).json({ok:false,error:e.message});}
+});
+
 app.get("/",function(req,res){res.sendFile(path.join(__dirname,"index.html"));});
 
 var PORT=process.env.PORT||3000;
