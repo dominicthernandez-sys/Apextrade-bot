@@ -9,99 +9,95 @@ const SECRET = process.env.ALPACA_SECRET_KEY;
 const PAPER = process.env.PAPER_TRADING !== "false";
 const BASE = PAPER ? "https://paper-api.alpaca.markets" : "https://api.alpaca.markets";
 const DATA = "https://data.alpaca.markets";
+const NEWS = "https://data.alpaca.markets/v1beta1/news";
 const LOSS = parseFloat(process.env.DAILY_LOSS_LIMIT || "-200");
 const WL = ["SPY","NVDA","AAPL","MSFT","QQQ","TSLA","AMZN","GOOGL","META","COIN","MSTR","AMD","PLTR","RIVN","SOFI","MARA","HOOD","SOUN","IONQ","RGTI","QUBT","SMCI","ARM","AVGO","MU","CVNA","UBER","LYFT","DASH"];
 const HDR = {"APCA-API-KEY-ID":KEY,"APCA-API-SECRET-KEY":SECRET};
 
-// Database setup
+// Negative and positive news keywords
+const BAD_WORDS = ["fraud","lawsuit","bankrupt","recall","investigation","resign","layoff","miss","downgrade","loss","warning","crash","halt","delist","probe","charges","fine","penalty","default","fail","cut","slash","drop","plunge","tumble","collapse","crisis","concern","risk","violation","sec","fdic","breach","hack","short","downside"];
+const GOOD_WORDS = ["beat","upgrade","buyback","acquisition","partnership","approve","launch","record","growth","profit","raise","exceed","strong","bullish","breakthrough","deal","contract","win","surge","rally","positive","expand","dividend","buy","outperform","momentum","milestone"];
+
+// Database
 const Database = require("better-sqlite3");
 const db = new Database("./trades.db");
+db.exec(`CREATE TABLE IF NOT EXISTS trades (id TEXT PRIMARY KEY, symbol TEXT, side TEXT, qty INTEGER, price REAL, pnl REAL, time TEXT, date TEXT, strategy TEXT, created_at INTEGER);`);
+const insertTrade = db.prepare(`INSERT OR IGNORE INTO trades (id,symbol,side,qty,price,pnl,time,date,strategy,created_at) VALUES (@id,@symbol,@side,@qty,@price,@pnl,@time,@date,@strategy,@created_at)`);
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS trades (
-    id TEXT PRIMARY KEY,
-    symbol TEXT,
-    side TEXT,
-    qty INTEGER,
-    price REAL,
-    pnl REAL,
-    time TEXT,
-    date TEXT,
-    strategy TEXT,
-    created_at INTEGER
-  );
-`);
-
-const insertTrade = db.prepare(`
-  INSERT OR IGNORE INTO trades (id, symbol, side, qty, price, pnl, time, date, strategy, created_at)
-  VALUES (@id, @symbol, @side, @qty, @price, @pnl, @time, @date, @strategy, @created_at)
-`);
-
-function saveTrade(trade){
+function saveTrade(t){
   try{
-    var d=new Date();
-    var date=d.toLocaleDateString("en-US",{timeZone:"America/New_York"});
-    insertTrade.run({
-      id: trade.id||("manual-"+Date.now()),
-      symbol: trade.symbol,
-      side: trade.side,
-      qty: trade.qty||0,
-      price: trade.price||0,
-      pnl: trade.pnl||0,
-      time: trade.time||"",
-      date: date,
-      strategy: trade.strategy||"",
-      created_at: Date.now()
-    });
-  }catch(e){console.error("DB save error:",e.message);}
+    var date=new Date().toLocaleDateString("en-US",{timeZone:"America/New_York"});
+    insertTrade.run({id:t.id||("m-"+Date.now()),symbol:t.symbol,side:t.side,qty:t.qty||0,price:t.price||0,pnl:t.pnl||0,time:t.time||"",date:date,strategy:t.strategy||"",created_at:Date.now()});
+  }catch(e){console.error("DB save:",e.message);}
 }
 
 function getTradesDB(period){
   try{
-    var d=new Date();
-    if(period==="today"){
-      var today=d.toLocaleDateString("en-US",{timeZone:"America/New_York"});
-      return db.prepare("SELECT * FROM trades WHERE date=? ORDER BY created_at DESC LIMIT 100").all(today);
-    } else if(period==="week"){
-      var weekAgo=Date.now()-(7*24*60*60*1000);
-      return db.prepare("SELECT * FROM trades WHERE created_at>? ORDER BY created_at DESC LIMIT 200").all(weekAgo);
-    } else if(period==="month"){
-      var monthAgo=Date.now()-(30*24*60*60*1000);
-      return db.prepare("SELECT * FROM trades WHERE created_at>? ORDER BY created_at DESC LIMIT 500").all(monthAgo);
-    } else {
-      return db.prepare("SELECT * FROM trades ORDER BY created_at DESC LIMIT 500").all();
-    }
-  }catch(e){console.error("DB read error:",e.message);return [];}
+    if(period==="today"){var d=new Date().toLocaleDateString("en-US",{timeZone:"America/New_York"});return db.prepare("SELECT * FROM trades WHERE date=? ORDER BY created_at DESC LIMIT 100").all(d);}
+    else if(period==="week"){return db.prepare("SELECT * FROM trades WHERE created_at>? ORDER BY created_at DESC LIMIT 200").all(Date.now()-7*864e5);}
+    else if(period==="month"){return db.prepare("SELECT * FROM trades WHERE created_at>? ORDER BY created_at DESC LIMIT 500").all(Date.now()-30*864e5);}
+    else{return db.prepare("SELECT * FROM trades ORDER BY created_at DESC LIMIT 500").all();}
+  }catch(e){return[];}
 }
 
 function getPnLDB(period){
-  try{
-    var rows=getTradesDB(period);
-    var total=rows.filter(function(r){return r.side==="SELL";}).reduce(function(a,r){return a+(r.pnl||0);},0);
-    var wins=rows.filter(function(r){return r.side==="SELL"&&r.pnl>0;}).length;
-    var losses=rows.filter(function(r){return r.side==="SELL"&&r.pnl<0;}).length;
-    return{total:total,wins:wins,losses:losses,trades:rows.length};
-  }catch(e){return{total:0,wins:0,losses:0,trades:0};}
+  var rows=getTradesDB(period);
+  var sells=rows.filter(function(r){return r.side==="SELL";});
+  return{total:sells.reduce(function(a,r){return a+(r.pnl||0);},0),wins:sells.filter(function(r){return r.pnl>0;}).length,losses:sells.filter(function(r){return r.pnl<0;}).length,trades:rows.length};
 }
 
-let running = true;
-let pnl = 0;
-let trades = [];
-let sigs = [];
-let prices = {};
-let hist = {};
-let volumes = {};
-let timer = null;
-let entryCount = {};
-let exitCount = {};
-let entryConf = {};
-let lastTick = Date.now();
-let tickCount = 0;
+let running=true,pnl=0,trades=[],sigs=[],prices={},hist={},volumes={},timer=null;
+let entryCount={},exitCount={},entryConf={},lastTick=Date.now(),tickCount=0;
+
+// News sentiment cache - refreshed every 5 minutes
+let newsCache={};
+let lastNewsUpdate=0;
 
 function aget(u){return fetch(BASE+u,{headers:HDR}).then(function(r){return r.json();});}
 function apost(u,b){return fetch(BASE+u,{method:"POST",headers:Object.assign({"Content-Type":"application/json"},HDR),body:JSON.stringify(b)}).then(function(r){return r.json();});}
 function dget(u){return fetch(DATA+u,{headers:HDR}).then(function(r){return r.json();});}
 function now(){return new Date().toLocaleTimeString("en-US",{timeZone:"America/New_York",hour:"2-digit",minute:"2-digit",second:"2-digit"});}
+
+// Fetch and analyze news for all tickers
+async function updateNews(){
+  if(Date.now()-lastNewsUpdate<300000)return; // only update every 5 mins
+  try{
+    var url=NEWS+"?symbols="+WL.join(",")+"&limit=50&sort=desc";
+    var resp=await fetch(url,{headers:HDR});
+    var data=await resp.json();
+    var articles=data.news||[];
+
+    // Reset cache
+    var fresh={};
+    WL.forEach(function(s){fresh[s]={score:0,headlines:[]};});
+
+    articles.forEach(function(article){
+      var headline=(article.headline||"").toLowerCase();
+      var syms=article.symbols||[];
+      var score=0;
+      GOOD_WORDS.forEach(function(w){if(headline.includes(w))score+=1;});
+      BAD_WORDS.forEach(function(w){if(headline.includes(w))score-=1;});
+      syms.forEach(function(sym){
+        if(fresh[sym]){
+          fresh[sym].score+=score;
+          if(fresh[sym].headlines.length<3)fresh[sym].headlines.push(article.headline);
+        }
+      });
+    });
+
+    newsCache=fresh;
+    lastNewsUpdate=Date.now();
+    console.log("News updated - "+articles.length+" articles processed");
+  }catch(e){console.error("News update error:",e.message);}
+}
+
+function getNewsSentiment(sym){
+  var n=newsCache[sym];
+  if(!n)return{score:0,label:"neutral",headlines:[]};
+  var score=n.score;
+  var label=score>=2?"bullish":score<=-2?"bearish":"neutral";
+  return{score:score,label:label,headlines:n.headlines||[]};
+}
 
 function calcRSI(arr){
   if(arr.length<14)return 50;
@@ -131,16 +127,26 @@ function getSig(sym){
   var cv=vols[vols.length-1]||0;
   var volOk=av===0||cv>=av;
   var pct=((cur-ma10)/ma10)*100;
+  var news=getNewsSentiment(sym);
+
+  // Block trades on strongly bearish news
+  if(news.label==="bearish"&&news.score<=-3)return null;
 
   if(pct>0.2&&cur>ma50&&rsi<70&&volOk){
     var conf=Math.min(99,Math.round(60+pct*8));
     if(rsi<50)conf=Math.min(99,conf+5);
     if(cv>av*1.5)conf=Math.min(99,conf+5);
-    return{type:"BUY",confidence:conf,reason:pct.toFixed(2)+"% above MA10 | RSI:"+Math.round(rsi),rsi:rsi};
+    // Boost confidence on bullish news
+    if(news.label==="bullish")conf=Math.min(99,conf+8);
+    if(news.label==="bearish")conf=Math.max(0,conf-10);
+    var reason=pct.toFixed(2)+"% above MA10 | RSI:"+Math.round(rsi)+" | News:"+news.label;
+    return{type:"BUY",confidence:conf,reason:reason,rsi:rsi,news:news};
   }
   if(pct<-0.2&&cur<ma50&&rsi>30&&volOk){
     var conf2=Math.min(99,Math.round(60+Math.abs(pct)*8));
-    return{type:"SELL",confidence:conf2,reason:Math.abs(pct).toFixed(2)+"% below MA10 | RSI:"+Math.round(rsi),rsi:rsi};
+    if(news.label==="bearish")conf2=Math.min(99,conf2+8);
+    var reason2=Math.abs(pct).toFixed(2)+"% below MA10 | RSI:"+Math.round(rsi)+" | News:"+news.label;
+    return{type:"SELL",confidence:conf2,reason:reason2,rsi:rsi,news:news};
   }
   return null;
 }
@@ -150,6 +156,10 @@ async function tick(){
   if(pnl<=LOSS){running=false;clearInterval(timer);console.log("Loss limit hit");return;}
   lastTick=Date.now();
   tickCount++;
+
+  // Update news every 5 minutes
+  await updateNews();
+
   try{
     var snap=await dget("/v2/stocks/snapshots?symbols="+WL.join(",")+"&feed=iex");
     if(snap){
@@ -179,7 +189,7 @@ async function tick(){
       if(!price)continue;
       var sig=getSig(sym);
       if(!sig)continue;
-      sigs.push({symbol:sym,type:sig.type,confidence:sig.confidence,reason:sig.reason,rsi:Math.round(sig.rsi),price:price,time:now()});
+      sigs.push({symbol:sym,type:sig.type,confidence:sig.confidence,reason:sig.reason,rsi:Math.round(sig.rsi),news:sig.news.label,price:price,time:now()});
 
       if(posMap[sym]){
         var pos=posMap[sym];
@@ -189,13 +199,14 @@ async function tick(){
         var unrealized=parseFloat(pos.unrealized_pl||0);
         var dh=Math.floor((Date.now()-new Date(pos.created_at||Date.now()).getTime())/86400000);
         if(!exitCount[sym])exitCount[sym]=0;
-        var conf=entryConf[sym]||65;
         var third=Math.max(1,Math.floor(sq/3));
         var sell=false,sellQty=sq,why="";
+        var news=getNewsSentiment(sym);
 
-        if(unrealized>=100&&conf<75&&exitCount[sym]<1){sell=true;sellQty=sq;why="$100 quick win";entryCount[sym]=0;exitCount[sym]=0;}
-        else if(unrealized>=150&&conf<85&&exitCount[sym]<1){sell=true;sellQty=sq;why="$150 quick win";entryCount[sym]=0;exitCount[sym]=0;}
-        else if(unrealized>=200&&conf<90&&exitCount[sym]<1){sell=true;sellQty=sq;why="$200 quick win";entryCount[sym]=0;exitCount[sym]=0;}
+        // Exit faster on very bad news
+        if(news.score<=-4&&gp>-5){sell=true;sellQty=sq;why="bad news exit";entryCount[sym]=0;exitCount[sym]=0;}
+        else if(unrealized>=100&&sig.confidence<75&&exitCount[sym]<1){sell=true;sellQty=sq;why="$100 quick win";entryCount[sym]=0;exitCount[sym]=0;}
+        else if(unrealized>=200&&exitCount[sym]<1){sell=true;sellQty=sq;why="$200 quick win";entryCount[sym]=0;exitCount[sym]=0;}
         else if(gp<=-15){sell=true;sellQty=sq;why="15pct stoploss";entryCount[sym]=0;exitCount[sym]=0;}
         else if(gp>=35&&exitCount[sym]<3){sell=true;sellQty=sq;why="35pct final exit";entryCount[sym]=0;exitCount[sym]=0;}
         else if(gp>=20&&exitCount[sym]<2){sell=true;sellQty=third;why="20pct scale out 2/3";exitCount[sym]=2;}
@@ -240,7 +251,7 @@ async function tick(){
           var bt={id:ord.id,symbol:sym,side:"BUY",qty:qty,price:price,pnl:null,time:now(),strategy:label};
           trades.unshift(bt);if(trades.length>50)trades.pop();
           saveTrade(bt);
-          console.log("BUY "+sym+" "+label+" RSI:"+Math.round(sig.rsi)+" conf:"+sig.confidence+"%");
+          console.log("BUY "+sym+" "+label+" RSI:"+Math.round(sig.rsi)+" news:"+sig.news.label+" conf:"+sig.confidence+"%");
         }
       }
     }
@@ -275,31 +286,26 @@ app.get("/status",async function(req,res){
   }catch(e){res.status(500).json({error:e.message});}
 });
 
+app.get("/news",function(req,res){
+  var result={};
+  WL.forEach(function(sym){result[sym]=getNewsSentiment(sym);});
+  res.json({news:result,lastUpdate:lastNewsUpdate});
+});
+
 app.get("/pnl",function(req,res){
-  var today=getPnLDB("today");
-  var week=getPnLDB("week");
-  var month=getPnLDB("month");
-  res.json({today:today,week:week,month:month});
+  res.json({today:getPnLDB("today"),week:getPnLDB("week"),month:getPnLDB("month")});
 });
 
 app.post("/sell/all",async function(req,res){
   try{
     var posArr=await aget("/v2/positions");
-    if(!Array.isArray(posArr)||posArr.length===0)return res.json({ok:true,message:"No positions to sell"});
+    if(!Array.isArray(posArr)||posArr.length===0)return res.json({ok:true,message:"No positions"});
     var results=[];
     for(var i=0;i<posArr.length;i++){
       var p=posArr[i];
       var qty=Math.abs(parseInt(p.qty));
       var ord=await apost("/v2/orders",{symbol:p.symbol,qty:qty,side:"sell",type:"market",time_in_force:"day"});
-      if(ord.id){
-        var sp=parseFloat(p.unrealized_pl||0);
-        pnl+=sp;
-        var t={id:ord.id,symbol:p.symbol,side:"SELL",qty:qty,price:parseFloat(p.current_price||0),pnl:sp,time:now(),strategy:"Manual sell all"};
-        trades.unshift(t);if(trades.length>50)trades.pop();
-        saveTrade(t);
-        entryCount[p.symbol]=0;exitCount[p.symbol]=0;
-        results.push(p.symbol);
-      }
+      if(ord.id){var sp=parseFloat(p.unrealized_pl||0);pnl+=sp;var t={id:ord.id,symbol:p.symbol,side:"SELL",qty:qty,price:parseFloat(p.current_price||0),pnl:sp,time:now(),strategy:"Manual sell all"};trades.unshift(t);saveTrade(t);entryCount[p.symbol]=0;exitCount[p.symbol]=0;results.push(p.symbol);}
     }
     res.json({ok:true,sold:results});
   }catch(e){res.status(500).json({ok:false,error:e.message});}
@@ -309,34 +315,18 @@ app.post("/sell/:sym",async function(req,res){
   try{
     var sym=req.params.sym.toUpperCase();
     var posArr=await aget("/v2/positions");
-    if(!Array.isArray(posArr))return res.json({ok:false,error:"No positions found"});
-    var pos=posArr.find(function(p){return p.symbol===sym;});
+    var pos=Array.isArray(posArr)&&posArr.find(function(p){return p.symbol===sym;});
     if(!pos)return res.json({ok:false,error:sym+" not found"});
     var qty=Math.abs(parseInt(pos.qty));
     var ord=await apost("/v2/orders",{symbol:sym,qty:qty,side:"sell",type:"market",time_in_force:"day"});
-    if(ord.id){
-      var sp=parseFloat(pos.unrealized_pl||0);
-      pnl+=sp;
-      var t={id:ord.id,symbol:sym,side:"SELL",qty:qty,price:parseFloat(pos.current_price||0),pnl:sp,time:now(),strategy:"Manual sell"};
-      trades.unshift(t);if(trades.length>50)trades.pop();
-      saveTrade(t);
-      entryCount[sym]=0;exitCount[sym]=0;
-      res.json({ok:true,orderId:ord.id});
-    } else {
-      res.json({ok:false,error:JSON.stringify(ord)});
-    }
+    if(ord.id){var sp=parseFloat(pos.unrealized_pl||0);pnl+=sp;var t={id:ord.id,symbol:sym,side:"SELL",qty:qty,price:parseFloat(pos.current_price||0),pnl:sp,time:now(),strategy:"Manual sell"};trades.unshift(t);saveTrade(t);entryCount[sym]=0;exitCount[sym]=0;res.json({ok:true});}
+    else{res.json({ok:false,error:JSON.stringify(ord)});}
   }catch(e){res.status(500).json({ok:false,error:e.message});}
 });
 
 app.all("/bot/start",function(req,res){startBot();res.json({ok:true,botRunning:true});});
 app.all("/bot/stop",function(req,res){stopBot();res.json({ok:true,botRunning:false});});
-
-app.get("/trades",function(req,res){
-  var period=req.query.period||"today";
-  var dbTrades=getTradesDB(period);
-  res.json({trades:dbTrades});
-});
-
+app.get("/trades",function(req,res){res.json({trades:getTradesDB(req.query.period||"today")});});
 app.get("/signals",function(req,res){res.json({signals:sigs});});
 app.get("/prices",function(req,res){res.json({prices:prices});});
 app.get("/",function(req,res){res.sendFile(path.join(__dirname,"index.html"));});
@@ -346,13 +336,9 @@ app.listen(PORT,function(){
   console.log("APEX TRADE port "+PORT+" | "+(PAPER?"PAPER":"LIVE"));
   startBot();
   setInterval(function(){
-    fetch("https://apextrade-bot.onrender.com/ping")
-      .then(function(r){return r.json();})
-      .then(function(d){if(!d.running){startBot();}})
-      .catch(function(e){console.log("Ping failed:"+e.message);});
+    fetch("https://apextrade-bot.onrender.com/ping").then(function(r){return r.json();}).then(function(d){if(!d.running){startBot();}}).catch(function(){});
   },30000);
   setInterval(function(){
-    var secs=(Date.now()-lastTick)/1000;
-    if(running&&secs>60){console.log("Watchdog restart");startBot();}
+    if(running&&(Date.now()-lastTick)/1000>60){console.log("Watchdog restart");startBot();}
   },120000);
 });
