@@ -280,10 +280,8 @@ async function tick(){
         buyLock[sym]=true;
         setTimeout(function(){buyLock[sym]=false;},(sym,30000));
 
-        var stopPrice=parseFloat((price*0.85).toFixed(2));
         var ord=await apost("/v2/orders",{symbol:sym,qty:qty,side:"buy",type:"market",time_in_force:"day"});
         if(ord.id){
-          await apost("/v2/orders",{symbol:sym,qty:qty,side:"sell",type:"stop",stop_price:stopPrice,time_in_force:"gtc"});
           entryCount[sym]++;
           entryConf[sym]=sig.confidence;
           entryConf[sym+"_strat"]=sig.strategy;
