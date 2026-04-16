@@ -5,37 +5,29 @@ const app = express();
 app.use(express.json());
 app.use(express.static(__dirname));
 
-// ── Alpaca ────────────────────────────────────────────────────────────────────
 const AKEY = process.env.ALPACA_KEY_ID;
 const ASECRET = process.env.ALPACA_SECRET_KEY;
 const PAPER = process.env.PAPER_TRADING !== "false";
 const ABASE = PAPER ? "https://paper-api.alpaca.markets" : "https://api.alpaca.markets";
 const ADATA = "https://data.alpaca.markets";
 const AHDR = {"APCA-API-KEY-ID":AKEY,"APCA-API-SECRET-KEY":ASECRET};
-
-// ── Coinbase ──────────────────────────────────────────────────────────────────
 const CB_KEY = process.env.COINBASE_API_KEY;
 const CB_SECRET = process.env.COINBASE_PRIVATE_KEY;
 const CB_BASE = "https://api.coinbase.com";
-
-// ── Config ────────────────────────────────────────────────────────────────────
 const LOSS = parseFloat(process.env.DAILY_LOSS_LIMIT || "-200");
 const STOCK_WL = ["SPY","NVDA","AAPL","MSFT","QQQ","TSLA","AMZN","GOOGL","META","COIN","MSTR","AMD","PLTR","RIVN","SOFI","MARA","HOOD","SOUN","IONQ","RGTI","QUBT","SMCI","ARM","AVGO","MU","CVNA","UBER","LYFT","DASH"];
 const CRYPTO_WL = ["BTC-USD","ETH-USD","SOL-USD","DOGE-USD","AVAX-USD"];
 
-// ── State ─────────────────────────────────────────────────────────────────────
 let running=false, pnl=0, trades=[], sigs=[], prices={}, hist={}, timer=null;
 let entryCount={}, exitCount={};
 let cryptoRunning=false, cryptoPnl=0, cryptoTrades=[], cryptoSigs=[];
 let cryptoPrices={}, cryptoHist={}, cryptoTimer=null;
 let cryptoEntryCount={}, cryptoExitCount={};
 
-// ── Alpaca helpers ────────────────────────────────────────────────────────────
 function aget(u){return fetch(ABASE+u,{headers:AHDR}).then(function(r){return r.json();});}
 function apost(u,b){return fetch(ABASE+u,{method:"POST",headers:Object.assign({"Content-Type":"application/json"},AHDR),body:JSON.stringify(b)}).then(function(r){return r.json();});}
 function dget(u){return fetch(ADATA+u,{headers:AHDR}).then(function(r){return r.json();});}
 
-// ── Coinbase JWT ──────────────────────────────────────────────────────────────
 function cbJWT(method,p){
   try{
     var header=Buffer.from(JSON.stringify({alg:"ES256",kid:CB_KEY})).toString("base64url");
@@ -47,11 +39,16 @@ function cbJWT(method,p){
     return header+"."+payload+"."+sig.toString("base64url");
   }catch(e){console.error("JWT:",e.message);return null;}
 }
-function cbget(p){var t=cbJWT("GET",p);if(!t)return Promise.resolve({});return fetch(CB_BASE+p,{headers:{"Authorization":"Bearer "+t,"Content-Type":"application/json"}}).then(function(r){return r.
-function cbpublic(pair){return fetch("https://api.coinbase.com/v2/prices/"+pair+"/spot").then(function(r){return r.json();});}
 function cbpost(p,b){var t=cbJWT("POST",p);if(!t)return Promise.resolve({});return fetch(CB_BASE+p,{method:"POST",headers:{"Authorization":"Bearer "+t,"Content-Type":"application/json"},body:JSON.stringify(b)}).then(function(r){return r.json();});}
+function cbget(p){var t=cbJWT("GET",p);if(!t)return Promise.resolve({});return fetch(CB_BASE+p,{headers:{"Authorization":"Bearer "+t,"Content-Type":"application/json"}}).then(function(r){return r.json();});}
 
-// ── Signal ────────────────────────────────────────────────────────────────────
+// Public price fetch - no auth needed
+function cbPrice(pair){
+  return fetch("https://api.coinbase.com/v2/prices/"+pair+"/spot")
+    .then(function(r){return r.json();})
+    .catch(function(){return {};});
+}
+
 function getSig(h){
   if(!h||h.length<10)return null;
   var ma=h.slice(-10).reduce(function(a,b){return a+b;},0)/10;
@@ -62,18 +59,14 @@ function getSig(h){
   return null;
 }
 
-// ── P&L calculator ────────────────────────────────────────────────────────────
-function calcPnL(tradeList, period){
+function calcPnL(tradeList,period){
   var now=Date.now();
   var cutoff=period==="today"?new Date().setHours(0,0,0,0):period==="week"?now-7*86400000:period==="month"?now-30*86400000:0;
-  var filtered=tradeList.filter(function(t){return t.side==="SELL"&&t.pnl!=null&&new Date(t.timestamp||now).getTime()>=cutoff;});
+  var filtered=tradeList.filter(function(t){return t.side==="SELL"&&t.pnl!=null&&(t.timestamp||now)>=cutoff;});
   var total=filtered.reduce(function(a,t){return a+(t.pnl||0);},0);
-  var wins=filtered.filter(function(t){return t.pnl>0;}).length;
-  var losses=filtered.filter(function(t){return t.pnl<=0;}).length;
-  return{total:parseFloat(total.toFixed(2)),wins,losses};
+  return{total:parseFloat(total.toFixed(2)),wins:filtered.filter(function(t){return t.pnl>0;}).length,losses:filtered.filter(function(t){return t.pnl<=0;}).length};
 }
 
-// ── Stock tick ────────────────────────────────────────────────────────────────
 async function tick(){
   if(!running)return;
   if(pnl<=LOSS){running=false;clearInterval(timer);return;}
@@ -146,23 +139,37 @@ async function tick(){
   }catch(e){console.error("Stock tick:",e.message);}
 }
 
-// ── Crypto tick ───────────────────────────────────────────────────────────────
 async function cryptoTick(){
   if(!cryptoRunning)return;
   try{
+    // Get prices using public API - no auth needed
     for(var i=0;i<CRYPTO_WL.length;i++){
       var pair=CRYPTO_WL[i];
       try{
-        var ticker=await cbpublic(pair);
+        var ticker=await cbPrice(pair);
         if(ticker&&ticker.data&&ticker.data.amount){
-          var p=parseFloat(ticker.data.amount||0);
-          if(p>0){cryptoPrices[pair]=p;if(!cryptoHist[pair])cryptoHist[pair]=[];if(!cryptoHist[pair].length||cryptoHist[pair][cryptoHist[pair].length-1]!==p){cryptoHist[pair].push(p);if(cryptoHist[pair].length>50)cryptoHist[pair].shift();}}
+          var p=parseFloat(ticker.data.amount);
+          if(p>0){
+            cryptoPrices[pair]=p;
+            if(!cryptoHist[pair])cryptoHist[pair]=[];
+            if(!cryptoHist[pair].length||cryptoHist[pair][cryptoHist[pair].length-1]!==p){
+              cryptoHist[pair].push(p);
+              if(cryptoHist[pair].length>50)cryptoHist[pair].shift();
+            }
+          }
         }
-      }catch(e){}
+      }catch(e){console.error("Crypto price "+pair+":",e.message);}
     }
+
+    // Get USD balance from Coinbase for trading
     var accts=await cbget("/api/v3/brokerage/accounts");
     var usdBal=0;
-    if(accts&&accts.accounts){accts.accounts.forEach(function(a){if(a.currency==="USD")usdBal=parseFloat(a.available_balance&&a.available_balance.value||0);});}
+    if(accts&&accts.accounts){
+      accts.accounts.forEach(function(a){
+        if(a.currency==="USD")usdBal=parseFloat(a.available_balance&&a.available_balance.value||0);
+      });
+    }
+
     cryptoSigs=[];
     for(var j=0;j<CRYPTO_WL.length;j++){
       var pair=CRYPTO_WL[j];
@@ -171,28 +178,41 @@ async function cryptoTick(){
       var sig=getSig(cryptoHist[pair]);
       if(!sig)continue;
       cryptoSigs.push({symbol:pair,type:sig.type,confidence:sig.confidence,reason:sig.reason,price:price,time:new Date().toLocaleTimeString()});
-      if(sig.type==="BUY"&&sig.confidence>=65){
+      if(sig.type==="BUY"&&sig.confidence>=65&&usdBal>1){
         if(!cryptoEntryCount[pair])cryptoEntryCount[pair]=0;
         var maxEntry=sig.confidence>=85?3:sig.confidence>=75?2:1;
         if(cryptoEntryCount[pair]>=maxEntry)continue;
         var maxExp=usdBal*(sig.confidence>=90?0.25:0.10);
         var spend=maxExp/3;
         if(spend<1)continue;
-        var order=await cbpost("/api/v3/brokerage/orders",{client_order_id:Date.now().toString(),product_id:pair,side:"BUY",order_configuration:{market_market_ioc:{quote_size:spend.toFixed(2)}}});
-        if(order&&order.success){cryptoEntryCount[pair]++;var label="Entry "+cryptoEntryCount[pair]+"/3";cryptoTrades.unshift({id:order.order_id||Date.now(),symbol:pair,side:"BUY",qty:(spend/price).toFixed(6),price:price,pnl:null,time:new Date().toLocaleTimeString(),timestamp:Date.now(),strategy:label});if(cryptoTrades.length>200)cryptoTrades.pop();console.log("CRYPTO BUY "+pair+" "+label);}
+        var order=await cbpost("/api/v3/brokerage/orders",{
+          client_order_id:Date.now().toString(),
+          product_id:pair,
+          side:"BUY",
+          order_configuration:{market_market_ioc:{quote_size:spend.toFixed(2)}}
+        });
+        if(order&&order.success){
+          cryptoEntryCount[pair]++;
+          var label="Entry "+cryptoEntryCount[pair]+"/3";
+          cryptoTrades.unshift({id:order.order_id||Date.now(),symbol:pair,side:"BUY",qty:(spend/price).toFixed(6),price:price,pnl:null,time:new Date().toLocaleTimeString(),timestamp:Date.now(),strategy:label});
+          if(cryptoTrades.length>200)cryptoTrades.pop();
+          console.log("CRYPTO BUY "+pair+" "+label);
+        }
       }
     }
   }catch(e){console.error("Crypto tick:",e.message);}
 }
 
-// ── Routes ────────────────────────────────────────────────────────────────────
 app.get("/ping",function(req,res){res.json({ok:true});});
+
 app.get("/debug/crypto",async function(req,res){
   try{
-    var result=await cbget("/api/v3/brokerage/products/BTC-USD");
-    res.json({ok:true,result:result});
+    var btc=await cbPrice("BTC-USD");
+    var accts=await cbget("/api/v3/brokerage/accounts");
+    res.json({ok:true,btcPrice:btc,accounts:accts});
   }catch(e){res.json({ok:false,error:e.message});}
 });
+
 app.get("/status",async function(req,res){
   try{
     var a=await aget("/v2/account");
@@ -202,16 +222,16 @@ app.get("/status",async function(req,res){
 });
 
 app.get("/pnl",function(req,res){
-  var allTrades=trades.concat(cryptoTrades);
-  res.json({today:calcPnL(allTrades,"today"),week:calcPnL(allTrades,"week"),month:calcPnL(allTrades,"month")});
+  var all=trades.concat(cryptoTrades);
+  res.json({today:calcPnL(all,"today"),week:calcPnL(all,"week"),month:calcPnL(all,"month")});
 });
 
 app.get("/trades",function(req,res){
   var period=req.query.period||"today";
-  var allTrades=trades.concat(cryptoTrades).sort(function(a,b){return (b.timestamp||0)-(a.timestamp||0);});
+  var all=trades.concat(cryptoTrades).sort(function(a,b){return(b.timestamp||0)-(a.timestamp||0);});
   var now=Date.now();
   var cutoff=period==="today"?new Date().setHours(0,0,0,0):period==="week"?now-7*86400000:period==="month"?now-30*86400000:0;
-  var filtered=period==="all"?allTrades:allTrades.filter(function(t){return(t.timestamp||now)>=cutoff;});
+  var filtered=period==="all"?all:all.filter(function(t){return(t.timestamp||now)>=cutoff;});
   res.json({trades:filtered.slice(0,100)});
 });
 
@@ -238,15 +258,8 @@ app.post("/sell/:sym",async function(req,res){
     if(!pos)return res.json({ok:false,error:"Position not found"});
     var qty=Math.abs(parseInt(pos.qty));
     var ord=await apost("/v2/orders",{symbol:sym,qty:qty,side:"sell",type:"market",time_in_force:"day"});
-    if(ord.id){
-      var sp=parseFloat(pos.unrealized_pl||0);
-      pnl+=sp;
-      trades.unshift({id:ord.id,symbol:sym,side:"SELL",qty:qty,price:parseFloat(pos.current_price||0),pnl:sp,time:new Date().toLocaleTimeString(),timestamp:Date.now(),strategy:"manual sell"});
-      entryCount[sym]=0;exitCount[sym]=0;
-      res.json({ok:true});
-    } else {
-      res.json({ok:false,error:ord.message||"Order failed"});
-    }
+    if(ord.id){var sp=parseFloat(pos.unrealized_pl||0);pnl+=sp;trades.unshift({id:ord.id,symbol:sym,side:"SELL",qty:qty,price:parseFloat(pos.current_price||0),pnl:sp,time:new Date().toLocaleTimeString(),timestamp:Date.now(),strategy:"manual sell"});entryCount[sym]=0;exitCount[sym]=0;res.json({ok:true});}
+    else res.json({ok:false,error:ord.message||"Order failed"});
   }catch(e){res.status(500).json({ok:false,error:e.message});}
 });
 
@@ -259,13 +272,7 @@ app.post("/sell/all",async function(req,res){
       var pos=posArr[i];
       var qty=Math.abs(parseInt(pos.qty));
       var ord=await apost("/v2/orders",{symbol:pos.symbol,qty:qty,side:"sell",type:"market",time_in_force:"day"});
-      if(ord.id){
-        var sp=parseFloat(pos.unrealized_pl||0);
-        pnl+=sp;
-        trades.unshift({id:ord.id,symbol:pos.symbol,side:"SELL",qty:qty,price:parseFloat(pos.current_price||0),pnl:sp,time:new Date().toLocaleTimeString(),timestamp:Date.now(),strategy:"manual sell all"});
-        entryCount[pos.symbol]=0;exitCount[pos.symbol]=0;
-        results.push(pos.symbol);
-      }
+      if(ord.id){var sp=parseFloat(pos.unrealized_pl||0);pnl+=sp;trades.unshift({id:ord.id,symbol:pos.symbol,side:"SELL",qty:qty,price:parseFloat(pos.current_price||0),pnl:sp,time:new Date().toLocaleTimeString(),timestamp:Date.now(),strategy:"manual sell all"});entryCount[pos.symbol]=0;exitCount[pos.symbol]=0;results.push(pos.symbol);}
     }
     res.json({ok:true,sold:results});
   }catch(e){res.status(500).json({ok:false,error:e.message});}
@@ -273,7 +280,6 @@ app.post("/sell/all",async function(req,res){
 
 app.get("/",function(req,res){res.sendFile(path.join(__dirname,"index.html"));});
 
-// ── Start ─────────────────────────────────────────────────────────────────────
 var PORT=process.env.PORT||3000;
 app.listen(PORT,function(){
   console.log("APEX TRADE port "+PORT+" | "+(PAPER?"PAPER":"LIVE")+" | Crypto: ON");
