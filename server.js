@@ -186,7 +186,12 @@ async function cryptoTick(){
 
 // ── Routes ────────────────────────────────────────────────────────────────────
 app.get("/ping",function(req,res){res.json({ok:true});});
-
+app.get("/debug/crypto",async function(req,res){
+  try{
+    var result=await cbget("/api/v3/brokerage/best_bid_ask?product_ids=BTC-USD");
+    res.json({ok:true,result:result});
+  }catch(e){res.json({ok:false,error:e.message});}
+});
 app.get("/status",async function(req,res){
   try{
     var a=await aget("/v2/account");
