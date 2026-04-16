@@ -28,16 +28,11 @@ function dget(u){return fetch(ADATA+u,{headers:AHDR}).then(function(r){return r.
 
 function makeCBJWT(method,reqPath){
   try{
-    var nonce=crypto.randomBytes(16).toString("hex");
+    var jwt=require("jsonwebtoken");
     var now=Math.floor(Date.now()/1000);
-    var hdr=Buffer.from(JSON.stringify({alg:"ES256",kid:CB_KEY_NAME,nonce:nonce,typ:"JWT"})).toString("base64url");
-    var pay=Buffer.from(JSON.stringify({exp:now+120,iss:"cdp",nbf:now,sub:CB_KEY_NAME,uri:method+" api.coinbase.com"+reqPath})).toString("base64url");
-    var msg=hdr+"."+pay;
-    var sign=crypto.createSign("SHA256");
-    sign.update(msg);
-    var keyObj=crypto.createPrivateKey({key:CB_PRIVATE_KEY,format:"pem"});
-    var sig=sign.sign({key:keyObj,dsaEncoding:"ieee-p1363"});
-    return msg+"."+sig.toString("base64url");
+    var payload={iss:"cdp",nbf:now,exp:now+120,sub:CB_KEY_NAME,uri:method+" api.coinbase.com"+reqPath};
+    var header={alg:"ES256",kid:CB_KEY_NAME,nonce:crypto.randomBytes(16).toString("hex")};
+    return jwt.sign(payload,CB_PRIVATE_KEY,{algorithm:"ES256",header:header});
   }catch(e){console.error("JWT err:",e.message);return null;}
 }
 
