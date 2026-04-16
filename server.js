@@ -28,11 +28,14 @@ function dget(u){return fetch(ADATA+u,{headers:AHDR}).then(function(r){return r.
 
 function makeCBJWT(method,reqPath){
   try{
-    var hdr=Buffer.from(JSON.stringify({typ:"JWT",kid:CB_KEY_NAME,nonce:crypto.randomBytes(16).toString("hex"),alg:"ES256"})).toString("base64url");
+    var nonce=crypto.randomBytes(16).toString("hex");
     var now=Math.floor(Date.now()/1000);
-    var pay=Buffer.from(JSON.stringify({iss:"coinbase-cloud",nbf:now,exp:now+120,sub:CB_KEY_NAME,uri:method+" api.coinbase.com"+reqPath})).toString("base64url");
+    var hdr=Buffer.from(JSON.stringify({alg:"ES256",kid:CB_KEY_NAME,nonce:nonce,typ:"JWT"})).toString("base64url");
+    var pay=Buffer.from(JSON.stringify({exp:now+120,iss:"cdp",nbf:now,sub:CB_KEY_NAME,uri:method+" api.coinbase.com"+reqPath})).toString("base64url");
     var msg=hdr+"."+pay;
-    var sig=crypto.createSign("SHA256").update(msg).sign({key:CB_PRIVATE_KEY,dsaEncoding:"ieee-p1363"});
+    var sign=crypto.createSign("SHA256");
+    sign.update(msg);
+    var sig=sign.sign({key:CB_PRIVATE_KEY,format:"pem",type:"sec1",dsaEncoding:"ieee-p1363"});
     return msg+"."+sig.toString("base64url");
   }catch(e){console.error("JWT err:",e.message);return null;}
 }
@@ -74,9 +77,7 @@ function calcPnlStats(tradeList){
     filtered.forEach(function(t){if(t.pnl!=null){total+=t.pnl;if(t.pnl>0)wins++;else if(t.pnl<0)losses++;}});
     return{total:parseFloat(total.toFixed(2)),wins:wins,losses:losses};
   }
-  function inPeriod(t,start){
-    var d=new Date(t.date||Date.now());return d>=start;
-  }
+  function inPeriod(t,start){var d=new Date(t.date||now);return d>=start;}
   return{
     today:stats(tradeList.filter(function(t){return inPeriod(t,todayStart);})),
     week:stats(tradeList.filter(function(t){return inPeriod(t,weekStart);})),
@@ -116,8 +117,8 @@ async function tick(){
         if(sell&&sellQty>0){
           var so=await apost("/v2/orders",{symbol:sym,qty:sellQty,side:"sell",type:"market",time_in_force:"day"});
           if(so.id){var sp=parseFloat(pos.unrealized_pl||0)*(sellQty/sq);pnl+=sp;
-            var td={id:so.id,symbol:sym,side:"SELL",qty:sellQty,price:price,pnl:sp,time:new Date().toLocaleTimeString(),strategy:why,market:"stocks",date:new Date().toISOString()};
-            trades.unshift(td);if(trades.length>200)trades.pop();}
+            trades.unshift({id:so.id,symbol:sym,side:"SELL",qty:sellQty,price:price,pnl:sp,time:new Date().toLocaleTimeString(),strategy:why,market:"stocks",date:new Date().toISOString()});
+            if(trades.length>200)trades.pop();}
         }
         continue;
       }
@@ -134,8 +135,8 @@ async function tick(){
         if(ord.id){
           await apost("/v2/orders",{symbol:sym,qty:qty,side:"sell",type:"stop",stop_price:stp,time_in_force:"gtc"});
           entryCount[sym]++;
-          var bt={id:ord.id,symbol:sym,side:"BUY",qty:qty,price:price,pnl:null,time:new Date().toLocaleTimeString(),strategy:"Entry "+entryCount[sym]+"/3",market:"stocks",date:new Date().toISOString()};
-          trades.unshift(bt);if(trades.length>200)trades.pop();
+          trades.unshift({id:ord.id,symbol:sym,side:"BUY",qty:qty,price:price,pnl:null,time:new Date().toLocaleTimeString(),strategy:"Entry "+entryCount[sym]+"/3",market:"stocks",date:new Date().toISOString()});
+          if(trades.length>200)trades.pop();
           console.log("BUY "+sym+" Entry "+entryCount[sym]+"/3");
         }
       }
@@ -154,7 +155,7 @@ async function cryptoTick(){
           var p=parseFloat(pb.asks&&pb.asks[0]&&pb.asks[0].price||pb.bids&&pb.bids[0]&&pb.bids[0].price||0);
           if(p>0){cPrices[pair]=p;addPx(cHist,pair,p);}
         }
-      }catch(e){}
+      }catch(e){console.error("Crypto price err "+pair+":",e.message);}
     }
     var accRes=await cbget("/api/v3/brokerage/accounts");
     var cbAcc={};
@@ -169,7 +170,7 @@ async function cryptoTick(){
         if(!cEntry[sym])cEntry[sym]=0;
         var maxE2=sig.confidence>=85?3:sig.confidence>=75?2:1;
         if(cEntry[sym]>=maxE2)continue;
-        var budget=(usd*(sig.confidence>=90?0.25:0.10)/3);
+        var budget=usd*(sig.confidence>=90?0.25:0.10)/3;
         if(budget<1)continue;
         var coin=sym.replace("-USD","");
         var holding=parseFloat(cbAcc[coin]&&cbAcc[coin].available_balance&&cbAcc[coin].available_balance.value||0);
@@ -177,8 +178,8 @@ async function cryptoTick(){
         var order=await cbpost("/api/v3/brokerage/orders",{client_order_id:crypto.randomUUID(),product_id:sym,side:"BUY",order_configuration:{market_market_ioc:{quote_size:budget.toFixed(2)}}});
         if(order&&order.success){
           cEntry[sym]++;
-          var ct={id:order.order_id||Date.now().toString(),symbol:sym,side:"BUY",qty:budget.toFixed(2),price:price,pnl:null,time:new Date().toLocaleTimeString(),strategy:"Crypto Entry "+cEntry[sym]+"/3",market:"crypto",date:new Date().toISOString()};
-          cTrades.unshift(ct);if(cTrades.length>100)cTrades.pop();
+          cTrades.unshift({id:order.order_id||Date.now().toString(),symbol:sym,side:"BUY",qty:budget.toFixed(2),price:price,pnl:null,time:new Date().toLocaleTimeString(),strategy:"Crypto Entry "+cEntry[sym]+"/3",market:"crypto",date:new Date().toISOString()});
+          if(cTrades.length>100)cTrades.pop();
           console.log("CRYPTO BUY "+sym+" $"+budget.toFixed(2));
         }
       }
@@ -198,8 +199,8 @@ async function cryptoTick(){
         var sord=await cbpost("/api/v3/brokerage/orders",{client_order_id:crypto.randomUUID(),product_id:sym,side:"SELL",order_configuration:{market_market_ioc:{base_size:sellAmt}}});
         if(sord&&sord.success){
           var sp2=parseFloat(sellAmt)*price*(gp2/100);cPnl+=sp2;
-          var st={id:sord.order_id||Date.now().toString(),symbol:sym,side:"SELL",qty:sellAmt,price:price,pnl:sp2,time:new Date().toLocaleTimeString(),strategy:why2,market:"crypto",date:new Date().toISOString()};
-          cTrades.unshift(st);if(cTrades.length>100)cTrades.pop();
+          cTrades.unshift({id:sord.order_id||Date.now().toString(),symbol:sym,side:"SELL",qty:sellAmt,price:price,pnl:sp2,time:new Date().toLocaleTimeString(),strategy:why2,market:"crypto",date:new Date().toISOString()});
+          if(cTrades.length>100)cTrades.pop();
         }
       }
     }
@@ -247,10 +248,10 @@ app.post("/sell/:symbol",async function(req,res){
     var qty=Math.abs(parseInt(pos.qty));
     var ord=await apost("/v2/orders",{symbol:sym,qty:qty,side:"sell",type:"market",time_in_force:"day"});
     if(ord.id){
-      var pnlVal=parseFloat(pos.unrealized_pl||0);pnl+=pnlVal;
-      trades.unshift({id:ord.id,symbol:sym,side:"SELL",qty:qty,price:parseFloat(pos.current_price||0),pnl:pnlVal,time:new Date().toLocaleTimeString(),strategy:"manual sell",market:"stocks",date:new Date().toISOString()});
+      var pv=parseFloat(pos.unrealized_pl||0);pnl+=pv;
+      trades.unshift({id:ord.id,symbol:sym,side:"SELL",qty:qty,price:parseFloat(pos.current_price||0),pnl:pv,time:new Date().toLocaleTimeString(),strategy:"manual sell",market:"stocks",date:new Date().toISOString()});
       entryCount[sym]=0;exitCount[sym]=0;
-      res.json({ok:true,symbol:sym,qty:qty,pnl:pnlVal});
+      res.json({ok:true,symbol:sym,qty:qty,pnl:pv});
     }else{res.json({ok:false,error:ord.message||"Order failed"});}
   }catch(e){res.status(500).json({ok:false,error:e.message});}
 });
@@ -261,14 +262,12 @@ app.post("/sell/all",async function(req,res){
     if(!Array.isArray(posArr)||posArr.length===0)return res.json({ok:true,message:"No positions"});
     var results=[];
     for(var i=0;i<posArr.length;i++){
-      var pos=posArr[i];var sym=pos.symbol;
-      var qty=Math.abs(parseInt(pos.qty));
+      var pos=posArr[i];var sym=pos.symbol;var qty=Math.abs(parseInt(pos.qty));
       var ord=await apost("/v2/orders",{symbol:sym,qty:qty,side:"sell",type:"market",time_in_force:"day"});
       if(ord.id){
         var pv=parseFloat(pos.unrealized_pl||0);pnl+=pv;
         trades.unshift({id:ord.id,symbol:sym,side:"SELL",qty:qty,price:parseFloat(pos.current_price||0),pnl:pv,time:new Date().toLocaleTimeString(),strategy:"manual sell all",market:"stocks",date:new Date().toISOString()});
-        entryCount[sym]=0;exitCount[sym]=0;
-        results.push(sym);
+        entryCount[sym]=0;exitCount[sym]=0;results.push(sym);
       }
     }
     res.json({ok:true,sold:results});
