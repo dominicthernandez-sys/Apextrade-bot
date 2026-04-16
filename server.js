@@ -188,7 +188,7 @@ async function cryptoTick(){
 app.get("/ping",function(req,res){res.json({ok:true});});
 app.get("/debug/crypto",async function(req,res){
   try{
-    var result=await cbget("/api/v3/brokerage/best_bid_ask?product_ids=BTC-USD");
+    var result=await cbget("/api/v3/brokerage/products/BTC-USD");
     res.json({ok:true,result:result});
   }catch(e){res.json({ok:false,error:e.message});}
 });
