@@ -47,7 +47,8 @@ function cbJWT(method,p){
     return header+"."+payload+"."+sig.toString("base64url");
   }catch(e){console.error("JWT:",e.message);return null;}
 }
-function cbget(p){var t=cbJWT("GET",p);if(!t)return Promise.resolve({});return fetch(CB_BASE+p,{headers:{"Authorization":"Bearer "+t,"Content-Type":"application/json"}}).then(function(r){return r.json();});}
+function cbget(p){var t=cbJWT("GET",p);if(!t)return Promise.resolve({});return fetch(CB_BASE+p,{headers:{"Authorization":"Bearer "+t,"Content-Type":"application/json"}}).then(function(r){return r.
+function cbpublic(pair){return fetch("https://api.coinbase.com/v2/prices/"+pair+"/spot").then(function(r){return r.json();});}
 function cbpost(p,b){var t=cbJWT("POST",p);if(!t)return Promise.resolve({});return fetch(CB_BASE+p,{method:"POST",headers:{"Authorization":"Bearer "+t,"Content-Type":"application/json"},body:JSON.stringify(b)}).then(function(r){return r.json();});}
 
 // ── Signal ────────────────────────────────────────────────────────────────────
@@ -152,9 +153,9 @@ async function cryptoTick(){
     for(var i=0;i<CRYPTO_WL.length;i++){
       var pair=CRYPTO_WL[i];
       try{
-        var ticker=await cbget("/api/v3/brokerage/best_bid_ask?product_ids="+pair);
-        if(ticker&&ticker.pricebooks&&ticker.pricebooks[0]){
-          var p=parseFloat(ticker.pricebooks[0].bids&&ticker.pricebooks[0].bids[0]&&ticker.pricebooks[0].bids[0].price||0);
+        var ticker=await cbpublic(pair);
+        if(ticker&&ticker.data&&ticker.data.amount){
+          var p=parseFloat(ticker.data.amount||0);
           if(p>0){cryptoPrices[pair]=p;if(!cryptoHist[pair])cryptoHist[pair]=[];if(!cryptoHist[pair].length||cryptoHist[pair][cryptoHist[pair].length-1]!==p){cryptoHist[pair].push(p);if(cryptoHist[pair].length>50)cryptoHist[pair].shift();}}
         }
       }catch(e){}
