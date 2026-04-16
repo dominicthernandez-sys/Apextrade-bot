@@ -35,7 +35,8 @@ function makeCBJWT(method,reqPath){
     var msg=hdr+"."+pay;
     var sign=crypto.createSign("SHA256");
     sign.update(msg);
-    var sig=sign.sign({key:CB_PRIVATE_KEY,format:"pem",type:"sec1",dsaEncoding:"ieee-p1363"});
+    var keyObj=crypto.createPrivateKey({key:CB_PRIVATE_KEY,format:"pem"});
+    var sig=sign.sign({key:keyObj,dsaEncoding:"ieee-p1363"});
     return msg+"."+sig.toString("base64url");
   }catch(e){console.error("JWT err:",e.message);return null;}
 }
