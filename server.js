@@ -13,7 +13,7 @@ const ADATA = "https://data.alpaca.markets";
 const AHDR = {"APCA-API-KEY-ID":AKEY,"APCA-API-SECRET-KEY":ASECRET};
 const LOSS = parseFloat(process.env.DAILY_LOSS_LIMIT || "-500");
 const CB_KEY_NAME = process.env.COINBASE_KEY_NAME;
-const CB_PRIVATE_KEY = (process.env.COINBASE_PRIVATE_KEY || "").replace(/\\n/g,"\n");
+const CB_PRIVATE_KEY = (process.env.COINBASE_PRIVATE_KEY || "").replace(/\\n/g,"\n").replace(/\r/g,"");
 const CB_BASE = "https://api.coinbase.com";
 
 const STOCKS = ["SPY","NVDA","AAPL","MSFT","QQQ","TSLA","AMZN","GOOGL","META","COIN","MSTR","AMD","PLTR","RIVN","SOFI","MARA","HOOD","SOUN","IONQ","RGTI","QUBT","ARM","AVGO","MU","CVNA","UBER","LYFT","DASH"];
@@ -32,7 +32,8 @@ function makeCBJWT(method,reqPath){
     var header=Buffer.from(JSON.stringify({alg:"ES256",kid:CB_KEY_NAME,nonce:crypto.randomBytes(16).toString("hex")})).toString("base64url");
     var payload=Buffer.from(JSON.stringify({iss:"cdp",nbf:now,exp:now+120,sub:CB_KEY_NAME,uri:method+" api.coinbase.com"+reqPath})).toString("base64url");
     var msg=header+"."+payload;
-    var key=crypto.createPrivateKey(CB_PRIVATE_KEY);
+    var keyStr=CB_PRIVATE_KEY.trim();
+    var key=crypto.createPrivateKey({key:keyStr,format:"pem"}); 
     var sig=crypto.sign("sha256",Buffer.from(msg),{key:key,dsaEncoding:"ieee-p1363"});
     return msg+"."+sig.toString("base64url");
   }catch(e){console.error("JWT err:",e.message);return null;}
