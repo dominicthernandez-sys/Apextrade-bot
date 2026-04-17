@@ -32,7 +32,7 @@ function makeCBJWT(method,reqPath){
     var header=Buffer.from(JSON.stringify({alg:"ES256",kid:CB_KEY_NAME,nonce:crypto.randomBytes(16).toString("hex")})).toString("base64url");
     var payload=Buffer.from(JSON.stringify({iss:"cdp",nbf:now,exp:now+120,sub:CB_KEY_NAME,uri:method+" api.coinbase.com"+reqPath})).toString("base64url");
     var msg=header+"."+payload;
-    var key=crypto.createPrivateKey({key:CB_PRIVATE_KEY,format:"pem",type:"sec1"});
+    var key=crypto.createPrivateKey(CB_PRIVATE_KEY);
     var sig=crypto.sign("sha256",Buffer.from(msg),{key:key,dsaEncoding:"ieee-p1363"});
     return msg+"."+sig.toString("base64url");
   }catch(e){console.error("JWT err:",e.message);return null;}
