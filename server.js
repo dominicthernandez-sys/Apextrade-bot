@@ -32,7 +32,8 @@ function makeCBJWT(method,reqPath){
     var now=Math.floor(Date.now()/1000);
     var payload={iss:"cdp",nbf:now,exp:now+120,sub:CB_KEY_NAME,uri:method+" api.coinbase.com"+reqPath};
     var header={alg:"ES256",kid:CB_KEY_NAME,nonce:crypto.randomBytes(16).toString("hex")};
-    return jwt.sign(payload,CB_PRIVATE_KEY,{algorithm:"ES256",header:header});
+    var keyObj=crypto.createPrivateKey({key:CB_PRIVATE_KEY,format:"pem"});
+    return jwt.sign(payload,keyObj,{algorithm:"ES256",header:header});
   }catch(e){console.error("JWT err:",e.message);return null;}
 }
 
