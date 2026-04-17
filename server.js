@@ -14,6 +14,8 @@ const AHDR = {"APCA-API-KEY-ID":AKEY,"APCA-API-SECRET-KEY":ASECRET};
 const LOSS = parseFloat(process.env.DAILY_LOSS_LIMIT || "-500");
 const CB_KEY_NAME = process.env.COINBASE_KEY_NAME;
 const CB_PRIVATE_KEY = (process.env.COINBASE_PRIVATE_KEY || "").replace(/\\n/g,"\n").replace(/\r/g,"");
+console.log("KEY NAME:", CB_KEY_NAME ? CB_KEY_NAME.substring(0,30)+"..." : "MISSING");
+console.log("PRIVATE KEY START:", CB_PRIVATE_KEY ? CB_PRIVATE_KEY.substring(0,27) : "MISSING");
 const CB_BASE = "https://api.coinbase.com";
 
 const STOCKS = ["SPY","NVDA","AAPL","MSFT","QQQ","TSLA","AMZN","GOOGL","META","COIN","MSTR","AMD","PLTR","RIVN","SOFI","MARA","HOOD","SOUN","IONQ","RGTI","QUBT","ARM","AVGO","MU","CVNA","UBER","LYFT","DASH"];
