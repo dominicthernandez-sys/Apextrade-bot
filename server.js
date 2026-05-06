@@ -87,9 +87,9 @@ function makeCBJWT(method, reqPath) {
       console.error("[CB JWT] Missing key name or private key");
       return null;
     }
-    const now    = Math.floor(Date.now() / 1000);
-    const nonce  = crypto.randomBytes(16).toString("hex");
-    const header = Buffer.from(JSON.stringify({ alg: "ES256", kid: CB_KEY_NAME, nonce })).toString("base64url");
+    const now   = Math.floor(Date.now() / 1000);
+    const nonce = crypto.randomBytes(16).toString("hex");
+    const header  = Buffer.from(JSON.stringify({ alg: "ES256", kid: CB_KEY_NAME, nonce })).toString("base64url");
     const payload = Buffer.from(JSON.stringify({
       iss: "cdp",
       nbf: now,
@@ -99,8 +99,18 @@ function makeCBJWT(method, reqPath) {
     })).toString("base64url");
 
     const msg = `${header}.${payload}`;
-    const key = crypto.createPrivateKey({ key: CB_PRIVATE_KEY, format: "pem" });
-    const sig = crypto.sign("sha256", Buffer.from(msg), { key, dsaEncoding: "ieee-p1363" });
+    
+    // FIXED: explicit sec1 type + null hash algo for ES256
+    const key = crypto.createPrivateKey({ 
+      key: CB_PRIVATE_KEY, 
+      format: "pem",
+      type: "sec1"
+    });
+    const sig = crypto.sign(null, Buffer.from(msg), { 
+      key, 
+      dsaEncoding: "ieee-p1363",
+      algorithm: "SHA256"
+    });
     return `${msg}.${sig.toString("base64url")}`;
   } catch (e) {
     console.error("[CB JWT] Error:", e.message);
