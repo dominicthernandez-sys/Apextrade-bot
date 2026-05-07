@@ -15,25 +15,26 @@ const AHDR        = { "APCA-API-KEY-ID": AKEY, "APCA-API-SECRET-KEY": ASECRET };
 const DAILY_LOSS  = parseFloat(process.env.DAILY_LOSS_LIMIT || "-500");
 const MAX_PER_STOCK = 2000;
 
+// ─── CRYPTO BUDGET CAP ($100 max total exposure) ──────────────────────────────
+const CRYPTO_MAX_TOTAL   = 100;   // hard cap: never deploy more than $100 across all crypto
+const CRYPTO_TRADE_PCT   = 0.10;  // 10% of available budget per entry = ~$10 bites
+const CRYPTO_MIN_TRADE   = 1.00;  // minimum order size in USD
+const CRYPTO_MAX_PER_SYM = 30;    // max $30 in any single crypto at once
+
 // ─── COINBASE CONFIG ──────────────────────────────────────────────────────────
-// Your CB_KEY_NAME should look like: "organizations/ORG_ID/apiKeys/KEY_ID"
-// Your CB_PRIVATE_KEY should be the full PEM including -----BEGIN EC PRIVATE KEY-----
-// OR the raw base64 of the 64-byte Ed25519 key (32-byte seed + 32-byte pubkey)
-const CB_KEY_NAME    = process.env.COINBASE_KEY_NAME || "";
+const CB_KEY_NAME        = process.env.COINBASE_KEY_NAME || "";
 const CB_PRIVATE_KEY_RAW = (process.env.COINBASE_PRIVATE_KEY || "")
   .replace(/\\n/g, "\n")
   .replace(/\r/g, "")
   .trim();
-const CB_BASE = "https://api.coinbase.com";
-
-// ─── DETECT KEY TYPE ──────────────────────────────────────────────────────────
-// CDP keys can be Ed25519 (base64 blob) or EC P-256 (PEM). Detect which we have.
-const CB_KEY_IS_PEM = CB_PRIVATE_KEY_RAW.includes("-----BEGIN");
+const CB_BASE        = "https://api.coinbase.com";
+const CB_KEY_IS_PEM  = CB_PRIVATE_KEY_RAW.includes("-----BEGIN");
 
 console.log("[BOOT] Alpaca paper:", PAPER);
 console.log("[BOOT] CB key name:", CB_KEY_NAME ? CB_KEY_NAME.substring(0, 40) + "..." : "MISSING");
 console.log("[BOOT] CB private key type:", CB_KEY_IS_PEM ? "PEM (ES256)" : "base64 blob (Ed25519/ES256)");
 console.log("[BOOT] CB private key present:", !!CB_PRIVATE_KEY_RAW);
+console.log(`[BOOT] Crypto budget cap: $${CRYPTO_MAX_TOTAL} | Per-trade: ${CRYPTO_TRADE_PCT * 100}% | Per-symbol max: $${CRYPTO_MAX_PER_SYM}`);
 
 // ─── UNIVERSE ─────────────────────────────────────────────────────────────────
 const STOCKS = [
@@ -55,6 +56,7 @@ let sEntryCount = {}, sExitCount = {};
 // Crypto state
 let cPnl = 0, cTrades = [], cSigs = [], cPrices = {}, cHist = {};
 let cEntryCount = {}, cExitCount = {};
+let cryptoBudgetDeployed = 0; // tracks total USD currently deployed in crypto
 
 // ─── DAILY RESET ─────────────────────────────────────────────────────────────
 function maybeDailyReset() {
@@ -71,6 +73,7 @@ function maybeDailyReset() {
   lastResetDay = todayNum;
   sPnl = 0; sEntryCount = {}; sExitCount = {};
   cPnl = 0; cEntryCount = {}; cExitCount = {};
+  cryptoBudgetDeployed = 0;
   console.log("[RESET] Daily state reset for", todayNum);
 }
 
@@ -90,17 +93,6 @@ function dget(u) {
 }
 
 // ─── COINBASE JWT ─────────────────────────────────────────────────────────────
-// Supports both key types that CDP issues:
-//   1. Ed25519 keys  → raw 64-byte base64 blob (no PEM headers)
-//   2. EC P-256 keys → full PEM string (-----BEGIN EC PRIVATE KEY-----)
-//
-// How to identify your key type in the CDP portal:
-//   - If the key was created with "Ed25519" algorithm selected → use type 1
-//   - If the key was created with "ES256" / "ECDSA" selected  → use type 2
-//
-// Set COINBASE_PRIVATE_KEY env var to the raw value from the portal (no extra escaping needed).
-// Set COINBASE_KEY_NAME to the full key name: "organizations/ORG/apiKeys/KEY_ID"
-
 function makeCBJWT(method, reqPath) {
   try {
     if (!CB_KEY_NAME || !CB_PRIVATE_KEY_RAW) {
@@ -129,49 +121,18 @@ function makeCBJWT(method, reqPath) {
     let sigBuf;
 
     if (CB_KEY_IS_PEM) {
-      // ── ES256 path: PEM key (EC P-256) ────────────────────────────────────
-      // This handles keys that look like:
-      //   -----BEGIN EC PRIVATE KEY-----
-      //   ...base64...
-      //   -----END EC PRIVATE KEY-----
-      const key = crypto.createPrivateKey({
-        key: CB_PRIVATE_KEY_RAW,
-        format: "pem"
-      });
-      sigBuf = crypto.sign(null, msgBuf, {
-        key,
-        dsaEncoding: "ieee-p1363",  // Required: compact R||S format for JWT
-        algorithm: "SHA256"
-      });
+      const key = crypto.createPrivateKey({ key: CB_PRIVATE_KEY_RAW, format: "pem" });
+      sigBuf = crypto.sign(null, msgBuf, { key, dsaEncoding: "ieee-p1363", algorithm: "SHA256" });
     } else {
-      // ── EdDSA path: raw base64 Ed25519 key ────────────────────────────────
-      // CDP Ed25519 keys are a 64-byte blob: first 32 bytes = seed, last 32 = public key
-      // Node.js crypto.sign with Ed25519 needs the key as a KeyObject
       const rawBytes = Buffer.from(CB_PRIVATE_KEY_RAW, "base64");
-
-      if (rawBytes.length !== 64) {
-        // Some CDP portals export just the 32-byte seed — handle both
-        if (rawBytes.length !== 32) {
-          console.error(`[CB JWT] Unexpected Ed25519 key length: ${rawBytes.length} bytes (expected 32 or 64)`);
-          return null;
-        }
+      if (rawBytes.length !== 64 && rawBytes.length !== 32) {
+        console.error(`[CB JWT] Unexpected Ed25519 key length: ${rawBytes.length} bytes (expected 32 or 64)`);
+        return null;
       }
-
-      // Node requires the key in DER/PKCS8 format for Ed25519.
-      // We build it manually: PKCS8 header (16 bytes) + 32-byte seed
       const seed = rawBytes.slice(0, 32);
-      const pkcs8Header = Buffer.from(
-        "302e020100300506032b657004220420", "hex"
-      ); // standard PKCS8 prefix for Ed25519
-      const pkcs8Der = Buffer.concat([pkcs8Header, seed]);
-
-      const key = crypto.createPrivateKey({
-        key: pkcs8Der,
-        format: "der",
-        type: "pkcs8"
-      });
-
-      // Ed25519 sign — no hash algorithm needed (it's built in)
+      const pkcs8Header = Buffer.from("302e020100300506032b657004220420", "hex");
+      const pkcs8Der    = Buffer.concat([pkcs8Header, seed]);
+      const key = crypto.createPrivateKey({ key: pkcs8Der, format: "der", type: "pkcs8" });
       sigBuf = crypto.sign(null, msgBuf, key);
     }
 
@@ -179,19 +140,15 @@ function makeCBJWT(method, reqPath) {
 
   } catch (e) {
     console.error("[CB JWT] Signing error:", e.message);
-    // Detailed help for common errors:
-    if (e.message.includes("error:0906D06C") || e.message.includes("PEM")) {
+    if (e.message.includes("error:0906D06C") || e.message.includes("PEM"))
       console.error("[CB JWT] Key format issue. Check that COINBASE_PRIVATE_KEY is the exact PEM or base64 from the CDP portal.");
-    }
-    if (e.message.includes("Invalid key length")) {
+    if (e.message.includes("Invalid key length"))
       console.error("[CB JWT] Ed25519 key blob is the wrong length. It should decode to 32 or 64 bytes.");
-    }
     return null;
   }
 }
 
 // ─── TEST JWT ON BOOT ─────────────────────────────────────────────────────────
-// Runs once at startup so you see immediately in logs if auth works
 async function testCoinbaseAuth() {
   if (!CB_KEY_NAME || !CB_PRIVATE_KEY_RAW) {
     console.warn("[CB AUTH] Skipping test — keys not configured");
@@ -200,22 +157,20 @@ async function testCoinbaseAuth() {
   try {
     console.log("[CB AUTH] Testing JWT generation...");
     const testJwt = makeCBJWT("GET", "/api/v3/brokerage/accounts");
-    if (!testJwt) {
-      console.error("[CB AUTH] ❌ JWT generation failed — check key format");
-      return;
-    }
+    if (!testJwt) { console.error("[CB AUTH] ❌ JWT generation failed — check key format"); return; }
+
     console.log("[CB AUTH] JWT generated OK, testing API call...");
-    const res = await fetch(`${CB_BASE}/api/v3/brokerage/accounts`, {
+    const res  = await fetch(`${CB_BASE}/api/v3/brokerage/accounts`, {
       headers: { "Authorization": `Bearer ${testJwt}`, "Content-Type": "application/json" }
     });
     const data = await res.json();
+
     if (data.accounts) {
       console.log(`[CB AUTH] ✅ Coinbase auth working — ${data.accounts.length} accounts found`);
       data.accounts.forEach(a => {
         const bal = parseFloat(a.available_balance?.value || 0);
-        if (bal > 0 || a.currency === "USD") {
+        if (bal > 0 || a.currency === "USD")
           console.log(`  [CB] ${a.currency}: $${bal.toFixed(2)}`);
-        }
       });
     } else if (data.error) {
       console.error("[CB AUTH] ❌ API error:", data.error, data.error_details || data.preview?.message || "");
@@ -230,7 +185,7 @@ async function testCoinbaseAuth() {
 
 // ─── COINBASE HTTP HELPERS ────────────────────────────────────────────────────
 function cbget(p) {
-  const t = makeCBJWT("GET", p);  // p already includes query string — this is fine
+  const t = makeCBJWT("GET", p);
   if (!t) return Promise.resolve({ _jwtFailed: true });
   return fetch(CB_BASE + p, {
     headers: { "Authorization": `Bearer ${t}`, "Content-Type": "application/json" }
@@ -238,10 +193,7 @@ function cbget(p) {
     .then(async r => {
       const text = await r.text();
       try { return JSON.parse(text); }
-      catch { 
-        console.error("[CB GET] Non-JSON:", text.substring(0, 500)); 
-        return {}; 
-      }
+      catch { console.error("[CB GET] Non-JSON:", text.substring(0, 500)); return {}; }
     })
     .catch(e => { console.error("[CB GET fetch]", e.message); return {}; });
 }
@@ -256,21 +208,20 @@ function cbpost(p, b) {
   })
     .then(r => r.json())
     .then(data => {
-      if (data.error || data.error_details) {
+      if (data.error || data.error_details)
         console.error("[CB POST]", p, JSON.stringify(data).substring(0, 200));
-      }
       return data;
     })
     .catch(e => { console.error("[CB POST fetch]", e.message); return {}; });
 }
 
-// ─── SIGNAL ENGINE ────────────────────────────────────────────────────────────
-function getSig(h) {
+// ─── STOCK SIGNAL ENGINE (unchanged — MA10, 0.15% threshold) ─────────────────
+function getStockSig(h) {
   if (!h || h.length < 10) return null;
   const window = h.slice(-10);
-  const ma  = window.reduce((a, b) => a + b, 0) / 10;
-  const c   = h[h.length - 1];
-  const pct = ((c - ma) / ma) * 100;
+  const ma     = window.reduce((a, b) => a + b, 0) / 10;
+  const c      = h[h.length - 1];
+  const pct    = ((c - ma) / ma) * 100;
 
   if (pct > 0.15) return {
     type: "BUY",
@@ -281,6 +232,32 @@ function getSig(h) {
     type: "SELL",
     confidence: Math.min(99, Math.round(60 + Math.abs(pct) * 8)),
     reason: `${pct.toFixed(2)}% below MA10`
+  };
+  return null;
+}
+
+// ─── CRYPTO SIGNAL ENGINE (tuned: MA7, 0.10% threshold, lower confidence) ────
+// Changes vs stock engine:
+//   • MA window: 7 samples (vs 10) — builds signal faster on 10s poll = 70s to prime
+//   • Threshold: 0.10% deviation (vs 0.15%) — catches quieter overnight moves
+//   • Confidence multiplier: 10 (vs 8) — reaches 65+ threshold more easily
+//   • Min confidence returned: 62 (vs 60) — less dead-zone near the gate
+function getCryptoSig(h) {
+  if (!h || h.length < 7) return null;
+  const window = h.slice(-7);
+  const ma     = window.reduce((a, b) => a + b, 0) / 7;
+  const c      = h[h.length - 1];
+  const pct    = ((c - ma) / ma) * 100;
+
+  if (pct > 0.10) return {
+    type: "BUY",
+    confidence: Math.min(99, Math.round(62 + pct * 10)),
+    reason: `+${pct.toFixed(3)}% above MA7`
+  };
+  if (pct < -0.10) return {
+    type: "SELL",
+    confidence: Math.min(99, Math.round(62 + Math.abs(pct) * 10)),
+    reason: `${pct.toFixed(3)}% below MA7`
   };
   return null;
 }
@@ -331,6 +308,21 @@ function isMarketHours() {
   return mins >= 13 * 60 + 30 && mins < 20 * 60;
 }
 
+// ─── CRYPTO BUDGET HELPER ─────────────────────────────────────────────────────
+// Calculates how much of the $100 budget is still available based on
+// current live CB account balances (so restarts don't double-count).
+async function getCryptoBudgetAvailable(cbAcc) {
+  let deployed = 0;
+  for (const pair of CRYPTO) {
+    const coin    = pair.replace("-USD", "");
+    const holding = parseFloat(cbAcc[coin]?.available_balance?.value || 0);
+    const price   = cPrices[pair] || 0;
+    deployed += holding * price;
+  }
+  const available = Math.max(0, CRYPTO_MAX_TOTAL - deployed);
+  return { deployed: parseFloat(deployed.toFixed(2)), available: parseFloat(available.toFixed(2)) };
+}
+
 // ─── STOCK TICK ───────────────────────────────────────────────────────────────
 async function stockTick() {
   if (!stockRunning) return;
@@ -370,7 +362,7 @@ async function stockTick() {
       const price = sPrices[sym];
       if (!price) continue;
 
-      const sig = getSig(sHist[sym]);
+      const sig = getStockSig(sHist[sym]);
       if (!sig) continue;
 
       sSigs.push({
@@ -436,9 +428,8 @@ async function stockTick() {
         const maxEntries = sig.confidence >= 85 ? 3 : sig.confidence >= 75 ? 2 : 1;
         if (sEntryCount[sym] >= maxEntries) continue;
 
-        const acct   = await aget("/v2/account");
-        const posVal = posMap[sym] ? parseFloat(posMap[sym].market_value || 0) : 0;
-        const room   = MAX_PER_STOCK - posVal;
+        const posVal     = posMap[sym] ? parseFloat(posMap[sym].market_value || 0) : 0;
+        const room       = MAX_PER_STOCK - posVal;
         if (room <= 50) continue;
 
         const entriesLeft = maxEntries - sEntryCount[sym];
@@ -475,6 +466,13 @@ async function stockTick() {
 }
 
 // ─── CRYPTO TICK ──────────────────────────────────────────────────────────────
+// Key changes from original:
+//   • Uses getCryptoSig() — MA7, 0.10% threshold
+//   • Polls every 10s (was 15s) — primes MA7 in ~70s instead of 2.5min+
+//   • BUY confidence gate: 65 (was 75)
+//   • Hard budget cap: $100 total across all crypto
+//   • Per-symbol cap: $30
+//   • Trade size: 10% of remaining budget (~$10/entry when fresh)
 async function cryptoTick() {
   if (!cryptoRunning) return;
   maybeDailyReset();
@@ -488,20 +486,20 @@ async function cryptoTick() {
   }
 
   try {
-    // ── Fetch prices via Coinbase best bid/ask ──
+    // ── Fetch prices ──────────────────────────────────────────────────────────
     for (const pair of CRYPTO) {
       try {
-      const res = await cbget(`/api/v3/brokerage/products/${pair}`);
-      if (res?._jwtFailed) { console.warn("[CB price] JWT failed"); return; }
-      const p = parseFloat(res?.price || res?.mid_market_price || 0);
-      if (p > 0) { cPrices[pair] = p; addPx(cHist, pair, p); }
-      else console.warn("[CB price]", pair, "no price in response");  
+        const res = await cbget(`/api/v3/brokerage/products/${pair}`);
+        if (res?._jwtFailed) { console.warn("[CB price] JWT failed"); return; }
+        const p = parseFloat(res?.price || res?.mid_market_price || 0);
+        if (p > 0) { cPrices[pair] = p; addPx(cHist, pair, p); }
+        else console.warn("[CB price]", pair, "no price in response");
       } catch (e) {
         console.error("[CB price fetch]", pair, e.message);
       }
     }
 
-    // ── Fetch CB accounts ──
+    // ── Fetch CB accounts ─────────────────────────────────────────────────────
     const accRes = await cbget("/api/v3/brokerage/accounts");
     const cbAcc  = {};
     if (accRes?.accounts) {
@@ -509,34 +507,70 @@ async function cryptoTick() {
     }
     const usd = parseFloat(cbAcc["USD"]?.available_balance?.value || 0);
 
-    // ── Generate signals & trade ──
+    // ── Budget check ──────────────────────────────────────────────────────────
+    const { deployed, available } = await getCryptoBudgetAvailable(cbAcc);
+    cryptoBudgetDeployed = deployed;
+
+    if (available < CRYPTO_MIN_TRADE) {
+      console.log(`[CRYPTO] Budget cap reached — $${deployed.toFixed(2)}/$${CRYPTO_MAX_TOTAL} deployed`);
+    }
+
+    // ── Generate signals ──────────────────────────────────────────────────────
     cSigs = [];
 
     for (const sym of CRYPTO) {
       const price = cPrices[sym];
       if (!price) continue;
 
-      const sig = getSig(cHist[sym]);
-      if (!sig) continue;
+      // Use tuned crypto signal engine
+      const sig = getCryptoSig(cHist[sym]);
+      if (!sig) {
+        const histLen = cHist[sym]?.length || 0;
+        if (histLen < 7) {
+          console.log(`[CRYPTO SIG] ${sym} warming up — ${histLen}/7 samples`);
+        }
+        continue;
+      }
 
       cSigs.push({
         symbol: sym, type: sig.type, confidence: sig.confidence,
         reason: sig.reason, price, time: new Date().toLocaleTimeString(), market: "crypto"
       });
 
-      // ── CRYPTO BUY ──
-      if (sig.type === "BUY" && sig.confidence >= 75) {
+      // ── CRYPTO BUY ────────────────────────────────────────────────────────
+      // Gate lowered to 65 (was 75). Budget enforced before ordering.
+      if (sig.type === "BUY" && sig.confidence >= 65) {
         if (!cEntryCount[sym]) cEntryCount[sym] = 0;
-        const maxE = sig.confidence >= 85 ? 3 : 2;
+        const maxE = sig.confidence >= 85 ? 3 : sig.confidence >= 75 ? 2 : 1;
         if (cEntryCount[sym] >= maxE) continue;
 
-        const entriesLeft = maxE - cEntryCount[sym];
-        const budget = (usd * 0.10) / entriesLeft;
-        if (budget < 1 || usd < 5) continue;
+        // Hard stop if total crypto budget is exhausted
+        if (available < CRYPTO_MIN_TRADE) {
+          console.log(`[CRYPTO BUY SKIP] ${sym} — budget cap reached ($${deployed}/$${CRYPTO_MAX_TOTAL})`);
+          continue;
+        }
 
-        const coin    = sym.replace("-USD", "");
-        const holding = parseFloat(cbAcc[coin]?.available_balance?.value || 0);
-        if (holding * price > MAX_PER_STOCK) continue;
+        // Per-symbol cap check
+        const coin          = sym.replace("-USD", "");
+        const holdingCoins  = parseFloat(cbAcc[coin]?.available_balance?.value || 0);
+        const symValue      = holdingCoins * price;
+        if (symValue >= CRYPTO_MAX_PER_SYM) {
+          console.log(`[CRYPTO BUY SKIP] ${sym} — per-symbol cap reached ($${symValue.toFixed(2)}/$${CRYPTO_MAX_PER_SYM})`);
+          continue;
+        }
+
+        // Respect actual USD balance too
+        if (usd < CRYPTO_MIN_TRADE) {
+          console.log(`[CRYPTO BUY SKIP] ${sym} — insufficient USD balance ($${usd.toFixed(2)})`);
+          continue;
+        }
+
+        // Trade size: 10% of remaining available budget, capped at per-symbol room
+        const symRoom      = CRYPTO_MAX_PER_SYM - symValue;
+        const budgetBite   = available * CRYPTO_TRADE_PCT;
+        const budget       = Math.min(budgetBite, symRoom, usd);
+
+        if (budget < CRYPTO_MIN_TRADE) continue;
 
         const order = await cbpost("/api/v3/brokerage/orders", {
           client_order_id: crypto.randomUUID(),
@@ -551,19 +585,19 @@ async function cryptoTick() {
             id: order.success_response?.order_id || Date.now().toString(),
             symbol: sym, side: "BUY", qty: `$${budget.toFixed(2)}`, price, pnl: null,
             time: new Date().toLocaleTimeString(),
-            strategy: `Crypto Entry ${cEntryCount[sym]}/${maxE}`,
+            strategy: `Entry ${cEntryCount[sym]}/${maxE} | conf:${sig.confidence}% | budget $${deployed.toFixed(0)}+${budget.toFixed(0)}/$${CRYPTO_MAX_TOTAL}`,
             market: "crypto", date: new Date().toISOString()
           });
           if (cTrades.length > 100) cTrades.pop();
-          console.log(`[CRYPTO BUY] ${sym} $${budget.toFixed(2)} @ $${price}`);
+          console.log(`[CRYPTO BUY] ${sym} $${budget.toFixed(2)} @ $${price} | conf:${sig.confidence}% | deployed $${(deployed + budget).toFixed(2)}/$${CRYPTO_MAX_TOTAL}`);
         } else if (order?.error_response || order?.error) {
           console.error(`[CRYPTO BUY FAILED] ${sym}:`, JSON.stringify(order).substring(0, 200));
         }
       }
 
-      // ── CRYPTO SELL ──
-      if (sig.type === "SELL" && sig.confidence >= 75) {
-        const coin = sym.replace("-USD", "");
+      // ── CRYPTO SELL ───────────────────────────────────────────────────────
+      if (sig.type === "SELL" && sig.confidence >= 65) {
+        const coin    = sym.replace("-USD", "");
         const holding = parseFloat(cbAcc[coin]?.available_balance?.value || 0);
         if (holding <= 0) continue;
         if (!cExitCount[sym]) cExitCount[sym] = 0;
@@ -626,7 +660,6 @@ async function cryptoTick() {
 // ─── ROUTES ───────────────────────────────────────────────────────────────────
 app.get("/ping", (req, res) => res.json({ ok: true, ts: Date.now() }));
 
-// Debug route — test Coinbase auth on demand
 app.get("/cb/test", async (req, res) => {
   try {
     const jwt = makeCBJWT("GET", "/api/v3/brokerage/accounts");
@@ -674,6 +707,11 @@ app.get("/status", async (req, res) => {
       totalPnL:  parseFloat((sPnl + cPnl).toFixed(2)),
       dailyLossLimit: DAILY_LOSS,
       maxPerStock: MAX_PER_STOCK,
+      cryptoBudget: {
+        cap:      CRYPTO_MAX_TOTAL,
+        deployed: cryptoBudgetDeployed,
+        available: parseFloat((CRYPTO_MAX_TOTAL - cryptoBudgetDeployed).toFixed(2))
+      },
       positions
     });
   } catch (e) {
@@ -709,14 +747,13 @@ app.get("/signals", (req, res) => {
 
 app.get("/prices", (req, res) => {
   const stockBoard = STOCKS.map(sym => ({
-    symbol: sym,
-    price: sPrices[sym] || null,
-    histLen: sHist[sym]?.length || 0
+    symbol: sym, price: sPrices[sym] || null, histLen: sHist[sym]?.length || 0
   }));
   const cryptoBoard = CRYPTO.map(sym => ({
-    symbol: sym,
-    price: cPrices[sym] || null,
-    histLen: cHist[sym]?.length || 0
+    symbol: sym, price: cPrices[sym] || null,
+    histLen: cHist[sym]?.length || 0,
+    // Show warmup progress toward MA7 threshold
+    warmupPct: Math.min(100, Math.round(((cHist[sym]?.length || 0) / 7) * 100))
   }));
   res.json({
     stocks: stockBoard,
@@ -795,9 +832,9 @@ app.all("/bot/start", (req, res) => {
   }
   if (!cryptoRunning) {
     cryptoRunning = true;
-    cTimer = setInterval(cryptoTick, 15000);
+    cTimer = setInterval(cryptoTick, 10000); // 10s — matches stocks now
     cryptoTick();
-    console.log("[BOT] Crypto bot started");
+    console.log("[BOT] Crypto bot started (10s interval)");
   }
   res.json({ ok: true, stockRunning, cryptoRunning });
 });
@@ -829,7 +866,7 @@ app.all("/bot/stop/stocks", (req, res) => {
 app.all("/bot/start/crypto", (req, res) => {
   if (!cryptoRunning) {
     cryptoRunning = true;
-    cTimer = setInterval(cryptoTick, 15000);
+    cTimer = setInterval(cryptoTick, 10000); // 10s
     cryptoTick();
   }
   res.json({ ok: true, cryptoRunning });
@@ -840,30 +877,29 @@ app.all("/bot/stop/crypto", (req, res) => {
   if (cTimer) { clearInterval(cTimer); cTimer = null; }
   res.json({ ok: true, cryptoRunning });
 });
+
 app.get("/cb/products", async (req, res) => {
   try {
     const data = await cbget("/api/v3/brokerage/products?limit=250");
-    // If no products, show raw response so we can debug
-    if (!data.products) {
-      return res.json({ raw: data });
-    }
+    if (!data.products) return res.json({ raw: data });
     const cryptoSymbols = ["BTC","ETH","SOL","DOGE","ADA"];
     const matches = data.products
       .filter(p => cryptoSymbols.some(c => p.product_id.startsWith(c)))
       .map(p => ({ id: p.product_id, price: p.price, status: p.status }));
     res.json({ matches, total: data.products.length });
-  } catch(e) {
+  } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
+
 app.get("/", (req, res) => res.sendFile(path.join(__dirname, "index.html")));
 
 // ─── BOOT ─────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
   console.log(`[APEX TRADE] Listening on port ${PORT} | PAPER=${PAPER} | MAX_PER_STOCK=$${MAX_PER_STOCK}`);
+  console.log(`[APEX TRADE] Crypto config: MA7 | 0.10% threshold | 65% confidence gate | $${CRYPTO_MAX_TOTAL} budget cap`);
 
-  // Test Coinbase auth before starting crypto bot
   await testCoinbaseAuth();
 
   stockRunning = true;
@@ -871,7 +907,7 @@ app.listen(PORT, async () => {
   stockTick();
 
   cryptoRunning = true;
-  cTimer = setInterval(cryptoTick, 15000);
+  cTimer = setInterval(cryptoTick, 10000); // 10s — was 15s
   cryptoTick();
 
   // Keep Render alive
@@ -890,7 +926,7 @@ app.listen(PORT, async () => {
     if (!cryptoRunning) {
       console.log("[WATCHDOG] Restarting crypto bot");
       cryptoRunning = true;
-      cTimer = setInterval(cryptoTick, 15000);
+      cTimer = setInterval(cryptoTick, 10000);
       cryptoTick();
     }
   }, 3600000);
