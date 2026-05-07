@@ -15,16 +15,25 @@ const AHDR        = { "APCA-API-KEY-ID": AKEY, "APCA-API-SECRET-KEY": ASECRET };
 const DAILY_LOSS  = parseFloat(process.env.DAILY_LOSS_LIMIT || "-500");
 const MAX_PER_STOCK = 2000;
 
+// ─── COINBASE CONFIG ──────────────────────────────────────────────────────────
+// Your CB_KEY_NAME should look like: "organizations/ORG_ID/apiKeys/KEY_ID"
+// Your CB_PRIVATE_KEY should be the full PEM including -----BEGIN EC PRIVATE KEY-----
+// OR the raw base64 of the 64-byte Ed25519 key (32-byte seed + 32-byte pubkey)
 const CB_KEY_NAME    = process.env.COINBASE_KEY_NAME || "";
-const CB_PRIVATE_KEY = (process.env.COINBASE_PRIVATE_KEY || "")
+const CB_PRIVATE_KEY_RAW = (process.env.COINBASE_PRIVATE_KEY || "")
   .replace(/\\n/g, "\n")
   .replace(/\r/g, "")
   .trim();
 const CB_BASE = "https://api.coinbase.com";
 
+// ─── DETECT KEY TYPE ──────────────────────────────────────────────────────────
+// CDP keys can be Ed25519 (base64 blob) or EC P-256 (PEM). Detect which we have.
+const CB_KEY_IS_PEM = CB_PRIVATE_KEY_RAW.includes("-----BEGIN");
+
 console.log("[BOOT] Alpaca paper:", PAPER);
 console.log("[BOOT] CB key name:", CB_KEY_NAME ? CB_KEY_NAME.substring(0, 40) + "..." : "MISSING");
-console.log("[BOOT] CB private key:", CB_PRIVATE_KEY ? CB_PRIVATE_KEY.substring(0, 27) + "..." : "MISSING");
+console.log("[BOOT] CB private key type:", CB_KEY_IS_PEM ? "PEM (ES256)" : "base64 blob (Ed25519/ES256)");
+console.log("[BOOT] CB private key present:", !!CB_PRIVATE_KEY_RAW);
 
 // ─── UNIVERSE ─────────────────────────────────────────────────────────────────
 const STOCKS = [
@@ -36,7 +45,7 @@ const CRYPTO = ["BTC-USD","ETH-USD","SOL-USD","DOGE-USD","ADA-USD"];
 
 // ─── STATE ────────────────────────────────────────────────────────────────────
 let stockRunning = false, cryptoRunning = false;
-let stockTimer = null, cTimer = null; // FIX: declare cTimer properly
+let stockTimer = null, cTimer = null;
 let lastResetDay = -1;
 
 // Stock state
@@ -81,43 +90,145 @@ function dget(u) {
 }
 
 // ─── COINBASE JWT ─────────────────────────────────────────────────────────────
+// Supports both key types that CDP issues:
+//   1. Ed25519 keys  → raw 64-byte base64 blob (no PEM headers)
+//   2. EC P-256 keys → full PEM string (-----BEGIN EC PRIVATE KEY-----)
+//
+// How to identify your key type in the CDP portal:
+//   - If the key was created with "Ed25519" algorithm selected → use type 1
+//   - If the key was created with "ES256" / "ECDSA" selected  → use type 2
+//
+// Set COINBASE_PRIVATE_KEY env var to the raw value from the portal (no extra escaping needed).
+// Set COINBASE_KEY_NAME to the full key name: "organizations/ORG/apiKeys/KEY_ID"
+
 function makeCBJWT(method, reqPath) {
   try {
-    if (!CB_KEY_NAME || !CB_PRIVATE_KEY) {
-      console.error("[CB JWT] Missing key name or private key");
+    if (!CB_KEY_NAME || !CB_PRIVATE_KEY_RAW) {
+      console.error("[CB JWT] Missing COINBASE_KEY_NAME or COINBASE_PRIVATE_KEY");
       return null;
     }
+
     const now   = Math.floor(Date.now() / 1000);
     const nonce = crypto.randomBytes(16).toString("hex");
-    const header  = Buffer.from(JSON.stringify({ alg: "ES256", kid: CB_KEY_NAME, nonce })).toString("base64url");
-    const payload = Buffer.from(JSON.stringify({
+
+    const headerObj = { alg: CB_KEY_IS_PEM ? "ES256" : "EdDSA", kid: CB_KEY_NAME, nonce, typ: "JWT" };
+    const payloadObj = {
       iss: "cdp",
       nbf: now,
       exp: now + 120,
       sub: CB_KEY_NAME,
+      aud: ["cdp_service"],
       uri: `${method} api.coinbase.com${reqPath}`
-    })).toString("base64url");
+    };
 
-    const msg = `${header}.${payload}`;
-    
-    // FIXED: explicit sec1 type + null hash algo for ES256
-    const key = crypto.createPrivateKey({ 
-      key: CB_PRIVATE_KEY, 
-      format: "pem",
-      type: "sec1"
-    });
-    const sig = crypto.sign(null, Buffer.from(msg), { 
-      key, 
-      dsaEncoding: "ieee-p1363",
-      algorithm: "SHA256"
-    });
-    return `${msg}.${sig.toString("base64url")}`;
+    const header  = Buffer.from(JSON.stringify(headerObj)).toString("base64url");
+    const payload = Buffer.from(JSON.stringify(payloadObj)).toString("base64url");
+    const msg     = `${header}.${payload}`;
+    const msgBuf  = Buffer.from(msg);
+
+    let sigBuf;
+
+    if (CB_KEY_IS_PEM) {
+      // ── ES256 path: PEM key (EC P-256) ────────────────────────────────────
+      // This handles keys that look like:
+      //   -----BEGIN EC PRIVATE KEY-----
+      //   ...base64...
+      //   -----END EC PRIVATE KEY-----
+      const key = crypto.createPrivateKey({
+        key: CB_PRIVATE_KEY_RAW,
+        format: "pem"
+      });
+      sigBuf = crypto.sign(null, msgBuf, {
+        key,
+        dsaEncoding: "ieee-p1363",  // Required: compact R||S format for JWT
+        algorithm: "SHA256"
+      });
+    } else {
+      // ── EdDSA path: raw base64 Ed25519 key ────────────────────────────────
+      // CDP Ed25519 keys are a 64-byte blob: first 32 bytes = seed, last 32 = public key
+      // Node.js crypto.sign with Ed25519 needs the key as a KeyObject
+      const rawBytes = Buffer.from(CB_PRIVATE_KEY_RAW, "base64");
+
+      if (rawBytes.length !== 64) {
+        // Some CDP portals export just the 32-byte seed — handle both
+        if (rawBytes.length !== 32) {
+          console.error(`[CB JWT] Unexpected Ed25519 key length: ${rawBytes.length} bytes (expected 32 or 64)`);
+          return null;
+        }
+      }
+
+      // Node requires the key in DER/PKCS8 format for Ed25519.
+      // We build it manually: PKCS8 header (16 bytes) + 32-byte seed
+      const seed = rawBytes.slice(0, 32);
+      const pkcs8Header = Buffer.from(
+        "302e020100300506032b657004220420", "hex"
+      ); // standard PKCS8 prefix for Ed25519
+      const pkcs8Der = Buffer.concat([pkcs8Header, seed]);
+
+      const key = crypto.createPrivateKey({
+        key: pkcs8Der,
+        format: "der",
+        type: "pkcs8"
+      });
+
+      // Ed25519 sign — no hash algorithm needed (it's built in)
+      sigBuf = crypto.sign(null, msgBuf, key);
+    }
+
+    return `${msg}.${sigBuf.toString("base64url")}`;
+
   } catch (e) {
-    console.error("[CB JWT] Error:", e.message);
+    console.error("[CB JWT] Signing error:", e.message);
+    // Detailed help for common errors:
+    if (e.message.includes("error:0906D06C") || e.message.includes("PEM")) {
+      console.error("[CB JWT] Key format issue. Check that COINBASE_PRIVATE_KEY is the exact PEM or base64 from the CDP portal.");
+    }
+    if (e.message.includes("Invalid key length")) {
+      console.error("[CB JWT] Ed25519 key blob is the wrong length. It should decode to 32 or 64 bytes.");
+    }
     return null;
   }
 }
 
+// ─── TEST JWT ON BOOT ─────────────────────────────────────────────────────────
+// Runs once at startup so you see immediately in logs if auth works
+async function testCoinbaseAuth() {
+  if (!CB_KEY_NAME || !CB_PRIVATE_KEY_RAW) {
+    console.warn("[CB AUTH] Skipping test — keys not configured");
+    return;
+  }
+  try {
+    console.log("[CB AUTH] Testing JWT generation...");
+    const testJwt = makeCBJWT("GET", "/api/v3/brokerage/accounts");
+    if (!testJwt) {
+      console.error("[CB AUTH] ❌ JWT generation failed — check key format");
+      return;
+    }
+    console.log("[CB AUTH] JWT generated OK, testing API call...");
+    const res = await fetch(`${CB_BASE}/api/v3/brokerage/accounts`, {
+      headers: { "Authorization": `Bearer ${testJwt}`, "Content-Type": "application/json" }
+    });
+    const data = await res.json();
+    if (data.accounts) {
+      console.log(`[CB AUTH] ✅ Coinbase auth working — ${data.accounts.length} accounts found`);
+      data.accounts.forEach(a => {
+        const bal = parseFloat(a.available_balance?.value || 0);
+        if (bal > 0 || a.currency === "USD") {
+          console.log(`  [CB] ${a.currency}: $${bal.toFixed(2)}`);
+        }
+      });
+    } else if (data.error) {
+      console.error("[CB AUTH] ❌ API error:", data.error, data.error_details || data.preview?.message || "");
+      console.error("[CB AUTH] Full response:", JSON.stringify(data).substring(0, 300));
+    } else {
+      console.warn("[CB AUTH] ⚠️  Unexpected response:", JSON.stringify(data).substring(0, 200));
+    }
+  } catch (e) {
+    console.error("[CB AUTH] ❌ Test request failed:", e.message);
+  }
+}
+
+// ─── COINBASE HTTP HELPERS ────────────────────────────────────────────────────
 function cbget(p) {
   const t = makeCBJWT("GET", p);
   if (!t) return Promise.resolve({ _jwtFailed: true });
@@ -367,7 +478,6 @@ async function cryptoTick() {
   if (!cryptoRunning) return;
   maybeDailyReset();
 
-  // FIX: Check daily loss limit for crypto too
   if (cPnl <= DAILY_LOSS) {
     console.log("[CRYPTO] Daily loss limit hit, pausing.");
     cryptoRunning = false;
@@ -377,15 +487,19 @@ async function cryptoTick() {
   }
 
   try {
-    // ── Fetch prices ──
+    // ── Fetch prices via Coinbase best bid/ask ──
     for (const pair of CRYPTO) {
       try {
         const res = await cbget(`/api/v3/brokerage/best_bid_ask?product_ids=${pair}`);
+        if (res?._jwtFailed) {
+          console.warn("[CB price] JWT failed — skipping crypto tick");
+          return;
+        }
         if (res?.pricebooks?.length > 0) {
           const pb = res.pricebooks[0];
           const p  = parseFloat(pb.asks?.[0]?.price || pb.bids?.[0]?.price || 0);
           if (p > 0) { cPrices[pair] = p; addPx(cHist, pair, p); }
-        } else if (res && !res._jwtFailed && !res.pricebooks) {
+        } else if (res && !res.pricebooks) {
           console.warn("[CB price]", pair, "unexpected response:", JSON.stringify(res).substring(0, 150));
         }
       } catch (e) {
@@ -448,12 +562,12 @@ async function cryptoTick() {
           });
           if (cTrades.length > 100) cTrades.pop();
           console.log(`[CRYPTO BUY] ${sym} $${budget.toFixed(2)} @ $${price}`);
+        } else if (order?.error_response || order?.error) {
+          console.error(`[CRYPTO BUY FAILED] ${sym}:`, JSON.stringify(order).substring(0, 200));
         }
       }
 
       // ── CRYPTO SELL ──
-      // FIX: Rewrote exit logic — original had fall-through bugs where why/sellAmt
-      // were set but no order was placed for scale-out conditions.
       if (sig.type === "SELL" && sig.confidence >= 75) {
         const coin = sym.replace("-USD", "");
         const holding = parseFloat(cbAcc[coin]?.available_balance?.value || 0);
@@ -476,15 +590,14 @@ async function cryptoTick() {
           cEntryCount[sym] = 0; cExitCount[sym] = 3;
         } else if (gp >= 20 && cExitCount[sym] < 2) {
           why = "scale-out +20%";
-          sellAmt = (holding / 3 * 2).toFixed(8); // FIX: was not calculated
+          sellAmt = (holding / 3 * 2).toFixed(8);
           cExitCount[sym] = 2;
         } else if (gp >= 10 && cExitCount[sym] < 1) {
           why = "scale-out +10%";
-          sellAmt = (holding / 3).toFixed(8); // FIX: was not calculated
+          sellAmt = (holding / 3).toFixed(8);
           cExitCount[sym] = 1;
         }
 
-        // FIX: Skip if no exit condition matched (was falling through to order)
         if (!why || !sellAmt) continue;
         if (parseFloat(sellAmt) * price < 1) continue;
 
@@ -506,6 +619,8 @@ async function cryptoTick() {
           });
           if (cTrades.length > 100) cTrades.pop();
           console.log(`[CRYPTO SELL] ${sym} ${sellAmt} | ${why} | P&L: $${sp.toFixed(2)}`);
+        } else if (sord?.error_response || sord?.error) {
+          console.error(`[CRYPTO SELL FAILED] ${sym}:`, JSON.stringify(sord).substring(0, 200));
         }
       }
     }
@@ -516,6 +631,29 @@ async function cryptoTick() {
 
 // ─── ROUTES ───────────────────────────────────────────────────────────────────
 app.get("/ping", (req, res) => res.json({ ok: true, ts: Date.now() }));
+
+// Debug route — test Coinbase auth on demand
+app.get("/cb/test", async (req, res) => {
+  try {
+    const jwt = makeCBJWT("GET", "/api/v3/brokerage/accounts");
+    if (!jwt) return res.json({ ok: false, error: "JWT generation failed — check server logs" });
+
+    const data = await fetch(`${CB_BASE}/api/v3/brokerage/accounts`, {
+      headers: { "Authorization": `Bearer ${jwt}`, "Content-Type": "application/json" }
+    }).then(r => r.json());
+
+    if (data.accounts) {
+      const balances = data.accounts
+        .filter(a => parseFloat(a.available_balance?.value || 0) > 0 || a.currency === "USD")
+        .map(a => ({ currency: a.currency, balance: a.available_balance?.value }));
+      res.json({ ok: true, accounts: balances });
+    } else {
+      res.json({ ok: false, error: data.error, detail: data.error_details || data.preview?.message });
+    }
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
 
 app.get("/status", async (req, res) => {
   try {
@@ -575,7 +713,6 @@ app.get("/signals", (req, res) => {
   res.json({ signals: [...sSigs, ...cSigs] });
 });
 
-// Enhanced prices endpoint — returns stocks with full universe + crypto prices
 app.get("/prices", (req, res) => {
   const stockBoard = STOCKS.map(sym => ({
     symbol: sym,
@@ -594,7 +731,7 @@ app.get("/prices", (req, res) => {
   });
 });
 
-// ─── FIX: /sell/all must be registered BEFORE /sell/:symbol ──────────────────
+// ─── SELL ROUTES ──────────────────────────────────────────────────────────────
 app.post("/sell/all", async (req, res) => {
   try {
     const posArr = await aget("/v2/positions");
@@ -625,7 +762,6 @@ app.post("/sell/all", async (req, res) => {
   }
 });
 
-// Manual sell single stock
 app.post("/sell/:symbol", async (req, res) => {
   try {
     const sym    = req.params.symbol.toUpperCase();
@@ -655,7 +791,7 @@ app.post("/sell/:symbol", async (req, res) => {
   }
 });
 
-// Bot controls
+// ─── BOT CONTROLS ─────────────────────────────────────────────────────────────
 app.all("/bot/start", (req, res) => {
   if (!stockRunning) {
     stockRunning = true;
@@ -715,8 +851,11 @@ app.get("/", (req, res) => res.sendFile(path.join(__dirname, "index.html")));
 
 // ─── BOOT ─────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`[APEX TRADE] Listening on port ${PORT} | PAPER=${PAPER} | MAX_PER_STOCK=$${MAX_PER_STOCK}`);
+
+  // Test Coinbase auth before starting crypto bot
+  await testCoinbaseAuth();
 
   stockRunning = true;
   stockTimer   = setInterval(stockTick, 10000);
