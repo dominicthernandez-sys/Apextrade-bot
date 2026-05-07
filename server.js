@@ -230,17 +230,18 @@ async function testCoinbaseAuth() {
 
 // ─── COINBASE HTTP HELPERS ────────────────────────────────────────────────────
 function cbget(p) {
-  const t = makeCBJWT("GET", p);
+  const t = makeCBJWT("GET", p);  // p already includes query string — this is fine
   if (!t) return Promise.resolve({ _jwtFailed: true });
   return fetch(CB_BASE + p, {
     headers: { "Authorization": `Bearer ${t}`, "Content-Type": "application/json" }
   })
-    .then(r => r.json())
-    .then(data => {
-      if (data.error || data.error_details) {
-        console.error("[CB GET]", p, JSON.stringify(data).substring(0, 200));
+    .then(async r => {
+      const text = await r.text();
+      try { return JSON.parse(text); }
+      catch { 
+        console.error("[CB GET] Non-JSON:", text.substring(0, 100)); 
+        return {}; 
       }
-      return data;
     })
     .catch(e => { console.error("[CB GET fetch]", e.message); return {}; });
 }
