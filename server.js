@@ -490,7 +490,14 @@ async function cryptoTick() {
     // ── Fetch prices via Coinbase best bid/ask ──
     for (const pair of CRYPTO) {
       try {
-        const res = await cbget(`/api/v3/brokerage/best_bid_ask?product_ids=${pair}`);
+        const res = await cbget(`/api/v3/brokerage/products/${pair}`);
+        if (res?.price) {
+          const p = parseFloat(res.price);
+          if (p > 0) { cPrices[pair] = p; addPx(cHist, pair, p); }
+        } else if (res?.mid_market_price) {
+          const p = parseFloat(res.mid_market_price);
+          if (p > 0) { cPrices[pair] = p; addPx(cHist, pair, p); }
+        }
         if (res?._jwtFailed) {
           console.warn("[CB price] JWT failed — skipping crypto tick");
           return;
