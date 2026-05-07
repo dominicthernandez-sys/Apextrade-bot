@@ -1,7 +1,7 @@
 const express = require("express");
-const path = require("path");
-const crypto = require("crypto");
-const app = express();
+const path    = require("path");
+const crypto  = require("crypto");
+const app     = express();
 app.use(express.json());
 app.use(express.static(__dirname));
 
@@ -15,11 +15,16 @@ const AHDR        = { "APCA-API-KEY-ID": AKEY, "APCA-API-SECRET-KEY": ASECRET };
 const DAILY_LOSS  = parseFloat(process.env.DAILY_LOSS_LIMIT || "-500");
 const MAX_PER_STOCK = 2000;
 
-// ─── CRYPTO BUDGET CAP ($100 max total exposure) ──────────────────────────────
+// ─── CRYPTO BUDGET CONFIG ─────────────────────────────────────────────────────
+// $100 hard cap. Per-trade = 15% of available budget (~$15 fresh).
+// Confidence gate raised to 70. Signal threshold raised to 0.25% (above fee floor).
+// MA window extended to 20 samples @ 10s poll = ~3 min context (much less noise).
 const CRYPTO_MAX_TOTAL   = 100;   // hard cap: never deploy more than $100 across all crypto
-const CRYPTO_TRADE_PCT   = 0.10;  // 10% of available budget per entry = ~$10 bites
-const CRYPTO_MIN_TRADE   = 1.00;  // minimum order size in USD
-const CRYPTO_MAX_PER_SYM = 30;    // max $30 in any single crypto at once
+const CRYPTO_TRADE_PCT   = 0.15;  // 15% of available budget per entry
+const CRYPTO_MIN_TRADE   = 2.00;  // minimum order size in USD (above CB minimums)
+const CRYPTO_MAX_PER_SYM = 40;    // max $40 in any single crypto at once
+const CRYPTO_FEE_PCT     = 0.006; // ~0.6% Coinbase taker fee each side
+const CRYPTO_BREAKEVEN   = CRYPTO_FEE_PCT * 2 * 100; // 1.2% — min move to profit
 
 // ─── COINBASE CONFIG ──────────────────────────────────────────────────────────
 const CB_KEY_NAME        = process.env.COINBASE_KEY_NAME || "";
@@ -27,14 +32,15 @@ const CB_PRIVATE_KEY_RAW = (process.env.COINBASE_PRIVATE_KEY || "")
   .replace(/\\n/g, "\n")
   .replace(/\r/g, "")
   .trim();
-const CB_BASE        = "https://api.coinbase.com";
-const CB_KEY_IS_PEM  = CB_PRIVATE_KEY_RAW.includes("-----BEGIN");
+const CB_BASE       = "https://api.coinbase.com";
+const CB_KEY_IS_PEM = CB_PRIVATE_KEY_RAW.includes("-----BEGIN");
 
 console.log("[BOOT] Alpaca paper:", PAPER);
 console.log("[BOOT] CB key name:", CB_KEY_NAME ? CB_KEY_NAME.substring(0, 40) + "..." : "MISSING");
-console.log("[BOOT] CB private key type:", CB_KEY_IS_PEM ? "PEM (ES256)" : "base64 blob (Ed25519/ES256)");
+console.log("[BOOT] CB private key type:", CB_KEY_IS_PEM ? "PEM (ES256)" : "base64 blob (Ed25519)");
 console.log("[BOOT] CB private key present:", !!CB_PRIVATE_KEY_RAW);
-console.log(`[BOOT] Crypto budget cap: $${CRYPTO_MAX_TOTAL} | Per-trade: ${CRYPTO_TRADE_PCT * 100}% | Per-symbol max: $${CRYPTO_MAX_PER_SYM}`);
+console.log(`[BOOT] Crypto budget: $${CRYPTO_MAX_TOTAL} cap | ${CRYPTO_TRADE_PCT * 100}% per trade | $${CRYPTO_MAX_PER_SYM} per symbol`);
+console.log(`[BOOT] Fee breakeven: ${CRYPTO_BREAKEVEN.toFixed(2)}% | Signal threshold: 0.25% | MA window: 20`);
 
 // ─── UNIVERSE ─────────────────────────────────────────────────────────────────
 const STOCKS = [
@@ -42,7 +48,10 @@ const STOCKS = [
   "COIN","MSTR","AMD","PLTR","RIVN","SOFI","MARA","HOOD","SOUN",
   "IONQ","RGTI","QUBT","ARM","AVGO","MU","CVNA","UBER","LYFT","DASH"
 ];
-const CRYPTO = ["BTC-USD","ETH-USD","SOL-USD","DOGE-USD","ADA-USD"];
+
+// ── Crypto universe trimmed to highest-liquidity pairs only.
+// DOGE and ADA removed — lower liquidity = wider spreads = harder to overcome fees.
+const CRYPTO = ["BTC-USD", "ETH-USD", "SOL-USD"];
 
 // ─── STATE ────────────────────────────────────────────────────────────────────
 let stockRunning = false, cryptoRunning = false;
@@ -56,7 +65,8 @@ let sEntryCount = {}, sExitCount = {};
 // Crypto state
 let cPnl = 0, cTrades = [], cSigs = [], cPrices = {}, cHist = {};
 let cEntryCount = {}, cExitCount = {};
-let cryptoBudgetDeployed = 0; // tracks total USD currently deployed in crypto
+let cEntryPrice = {}; // ← NEW: tracks actual avg entry price per symbol
+let cryptoBudgetDeployed = 0;
 
 // ─── DAILY RESET ─────────────────────────────────────────────────────────────
 function maybeDailyReset() {
@@ -73,6 +83,7 @@ function maybeDailyReset() {
   lastResetDay = todayNum;
   sPnl = 0; sEntryCount = {}; sExitCount = {};
   cPnl = 0; cEntryCount = {}; cExitCount = {};
+  cEntryPrice = {};
   cryptoBudgetDeployed = 0;
   console.log("[RESET] Daily state reset for", todayNum);
 }
@@ -141,9 +152,9 @@ function makeCBJWT(method, reqPath) {
   } catch (e) {
     console.error("[CB JWT] Signing error:", e.message);
     if (e.message.includes("error:0906D06C") || e.message.includes("PEM"))
-      console.error("[CB JWT] Key format issue. Check that COINBASE_PRIVATE_KEY is the exact PEM or base64 from the CDP portal.");
+      console.error("[CB JWT] Key format issue. Check COINBASE_PRIVATE_KEY is the exact PEM or base64 from CDP portal.");
     if (e.message.includes("Invalid key length"))
-      console.error("[CB JWT] Ed25519 key blob is the wrong length. It should decode to 32 or 64 bytes.");
+      console.error("[CB JWT] Ed25519 key blob is the wrong length. Should decode to 32 or 64 bytes.");
     return null;
   }
 }
@@ -215,7 +226,7 @@ function cbpost(p, b) {
     .catch(e => { console.error("[CB POST fetch]", e.message); return {}; });
 }
 
-// ─── STOCK SIGNAL ENGINE (unchanged — MA10, 0.15% threshold) ─────────────────
+// ─── STOCK SIGNAL ENGINE (MA10, 0.15% threshold) ──────────────────────────────
 function getStockSig(h) {
   if (!h || h.length < 10) return null;
   const window = h.slice(-10);
@@ -236,28 +247,36 @@ function getStockSig(h) {
   return null;
 }
 
-// ─── CRYPTO SIGNAL ENGINE (tuned: MA7, 0.10% threshold, lower confidence) ────
-// Changes vs stock engine:
-//   • MA window: 7 samples (vs 10) — builds signal faster on 10s poll = 70s to prime
-//   • Threshold: 0.10% deviation (vs 0.15%) — catches quieter overnight moves
-//   • Confidence multiplier: 10 (vs 8) — reaches 65+ threshold more easily
-//   • Min confidence returned: 62 (vs 60) — less dead-zone near the gate
+// ─── CRYPTO SIGNAL ENGINE (FIXED) ────────────────────────────────────────────
+//
+// KEY CHANGES from original:
+//   • MA window: 20 samples @ 10s poll = ~3 min price context (was 7 = 70s, too noisy)
+//   • Signal threshold: 0.25% (was 0.10% — was BELOW fee breakeven of 1.2% round-trip)
+//   • Confidence gate: 70 (was 65) — higher bar for a real signal
+//   • Confidence multiplier: 12 — reaches gate more meaningfully
+//   • Comment shows fee math so it's visible in code
+//
+// Fee reality: CB charges ~0.6% each side = 1.2% round-trip cost.
+// A 0.10% signal threshold guaranteed losses. 0.25% is still tight but
+// at least gives the position room to grow past break-even.
 function getCryptoSig(h) {
-  if (!h || h.length < 7) return null;
-  const window = h.slice(-7);
-  const ma     = window.reduce((a, b) => a + b, 0) / 7;
+  if (!h || h.length < 20) return null;         // need 20 samples to prime
+
+  const window = h.slice(-20);
+  const ma     = window.reduce((a, b) => a + b, 0) / 20;
   const c      = h[h.length - 1];
   const pct    = ((c - ma) / ma) * 100;
 
-  if (pct > 0.10) return {
+  // Threshold: 0.25% — above noise floor, gives room past 1.2% fee cost
+  if (pct > 0.25) return {
     type: "BUY",
-    confidence: Math.min(99, Math.round(62 + pct * 10)),
-    reason: `+${pct.toFixed(3)}% above MA7`
+    confidence: Math.min(99, Math.round(62 + pct * 12)),
+    reason: `+${pct.toFixed(3)}% above MA20 (fee floor: ${CRYPTO_BREAKEVEN.toFixed(2)}%)`
   };
-  if (pct < -0.10) return {
+  if (pct < -0.25) return {
     type: "SELL",
-    confidence: Math.min(99, Math.round(62 + Math.abs(pct) * 10)),
-    reason: `${pct.toFixed(3)}% below MA7`
+    confidence: Math.min(99, Math.round(62 + Math.abs(pct) * 12)),
+    reason: `${pct.toFixed(3)}% below MA20`
   };
   return null;
 }
@@ -267,7 +286,7 @@ function addPx(hist, sym, price) {
   const arr = hist[sym];
   if (!arr.length || arr[arr.length - 1] !== price) {
     arr.push(price);
-    if (arr.length > 50) arr.shift();
+    if (arr.length > 100) arr.shift(); // extended buffer (was 50)
   }
 }
 
@@ -309,8 +328,6 @@ function isMarketHours() {
 }
 
 // ─── CRYPTO BUDGET HELPER ─────────────────────────────────────────────────────
-// Calculates how much of the $100 budget is still available based on
-// current live CB account balances (so restarts don't double-count).
 async function getCryptoBudgetAvailable(cbAcc) {
   let deployed = 0;
   for (const pair of CRYPTO) {
@@ -321,6 +338,16 @@ async function getCryptoBudgetAvailable(cbAcc) {
   }
   const available = Math.max(0, CRYPTO_MAX_TOTAL - deployed);
   return { deployed: parseFloat(deployed.toFixed(2)), available: parseFloat(available.toFixed(2)) };
+}
+
+// ─── WEIGHTED AVERAGE ENTRY PRICE HELPER ──────────────────────────────────────
+// Tracks true avg entry price so sell logic uses real cost basis, not history[0].
+// Called every time a BUY fills successfully.
+function updateEntryPrice(sym, prevHolding, prevAvg, addedUsd, newPrice) {
+  const addedCoins = addedUsd / newPrice;
+  const totalCoins = prevHolding + addedCoins;
+  if (totalCoins <= 0) return newPrice;
+  return ((prevHolding * prevAvg) + (addedCoins * newPrice)) / totalCoins;
 }
 
 // ─── STOCK TICK ───────────────────────────────────────────────────────────────
@@ -428,8 +455,8 @@ async function stockTick() {
         const maxEntries = sig.confidence >= 85 ? 3 : sig.confidence >= 75 ? 2 : 1;
         if (sEntryCount[sym] >= maxEntries) continue;
 
-        const posVal     = posMap[sym] ? parseFloat(posMap[sym].market_value || 0) : 0;
-        const room       = MAX_PER_STOCK - posVal;
+        const posVal = posMap[sym] ? parseFloat(posMap[sym].market_value || 0) : 0;
+        const room   = MAX_PER_STOCK - posVal;
         if (room <= 50) continue;
 
         const entriesLeft = maxEntries - sEntryCount[sym];
@@ -465,14 +492,19 @@ async function stockTick() {
   }
 }
 
-// ─── CRYPTO TICK ──────────────────────────────────────────────────────────────
-// Key changes from original:
-//   • Uses getCryptoSig() — MA7, 0.10% threshold
-//   • Polls every 10s (was 15s) — primes MA7 in ~70s instead of 2.5min+
-//   • BUY confidence gate: 65 (was 75)
-//   • Hard budget cap: $100 total across all crypto
-//   • Per-symbol cap: $30
-//   • Trade size: 10% of remaining budget (~$10/entry when fresh)
+// ─── CRYPTO TICK (REWRITTEN) ──────────────────────────────────────────────────
+//
+// Key fixes vs original:
+//   1. Uses fixed getCryptoSig() — MA20, 0.25% threshold (above fee floor)
+//   2. Confidence gate raised to 70
+//   3. Exit logic uses cEntryPrice[sym] — actual avg cost basis — NOT cHist[sym][0]
+//   4. Stop-loss tightened: -8% (was -15%) — protects $100 account aggressively
+//   5. Profit targets adjusted: +5% scale, +12% scale, +20% full exit
+//      Rationale: smaller account needs smaller, faster wins vs 35% moonshot targets
+//   6. Stale position exit: 4 hours with < 1.5% gain (crypto moves fast enough)
+//   7. Entry price tracked via weighted average on each additional buy
+//   8. Universe trimmed to BTC/ETH/SOL only
+//
 async function cryptoTick() {
   if (!cryptoRunning) return;
   maybeDailyReset();
@@ -511,23 +543,19 @@ async function cryptoTick() {
     const { deployed, available } = await getCryptoBudgetAvailable(cbAcc);
     cryptoBudgetDeployed = deployed;
 
-    if (available < CRYPTO_MIN_TRADE) {
-      console.log(`[CRYPTO] Budget cap reached — $${deployed.toFixed(2)}/$${CRYPTO_MAX_TOTAL} deployed`);
-    }
-
-    // ── Generate signals ──────────────────────────────────────────────────────
+    // ── Generate signals and act ──────────────────────────────────────────────
     cSigs = [];
 
     for (const sym of CRYPTO) {
       const price = cPrices[sym];
       if (!price) continue;
 
-      // Use tuned crypto signal engine
+      const histLen = cHist[sym]?.length || 0;
+
       const sig = getCryptoSig(cHist[sym]);
       if (!sig) {
-        const histLen = cHist[sym]?.length || 0;
-        if (histLen < 7) {
-          console.log(`[CRYPTO SIG] ${sym} warming up — ${histLen}/7 samples`);
+        if (histLen < 20) {
+          console.log(`[CRYPTO SIG] ${sym} warming up — ${histLen}/20 samples (~${Math.round((20 - histLen) * 10 / 60)}min remaining)`);
         }
         continue;
       }
@@ -537,11 +565,109 @@ async function cryptoTick() {
         reason: sig.reason, price, time: new Date().toLocaleTimeString(), market: "crypto"
       });
 
+      const coin         = sym.replace("-USD", "");
+      const holdingCoins = parseFloat(cbAcc[coin]?.available_balance?.value || 0);
+      const symValue     = holdingCoins * price;
+
+      // ── CRYPTO SELL (checked first — exits take priority over entries) ─────
+      if (holdingCoins > 0) {
+        if (!cExitCount[sym]) cExitCount[sym] = 0;
+
+        // Use actual tracked entry price — NOT cHist[sym][0]
+        const ep = cEntryPrice[sym] || price;
+        const gp = ((price - ep) / ep) * 100;
+
+        // Include fee cost in gain display so it's honest
+        const gpAfterFees = gp - CRYPTO_BREAKEVEN;
+
+        let why = "";
+        let sellAmt = null;
+
+        // Stop-loss: -8% from actual entry (tighter — protects small account)
+        if (gp <= -8) {
+          why = `stop-loss -8% from entry $${ep.toFixed(2)}`;
+          sellAmt = holdingCoins.toFixed(8);
+          cEntryCount[sym] = 0; cExitCount[sym] = 0;
+          delete cEntryPrice[sym];
+
+        // Full exit at +20% (was +35% — more realistic for crypto scalping)
+        } else if (gp >= 20 && cExitCount[sym] < 3) {
+          why = `target +20% final (net ~+${gpAfterFees.toFixed(1)}% after fees)`;
+          sellAmt = holdingCoins.toFixed(8);
+          cEntryCount[sym] = 0; cExitCount[sym] = 3;
+          delete cEntryPrice[sym];
+
+        // Scale-out 2/3 at +12%
+        } else if (gp >= 12 && cExitCount[sym] < 2) {
+          why = `scale-out +12% (2/3 position)`;
+          sellAmt = (holdingCoins * 2 / 3).toFixed(8);
+          cExitCount[sym] = 2;
+
+        // Scale-out 1/3 at +5% (was +10% — faster partial profit on small account)
+        } else if (gp >= 5 && cExitCount[sym] < 1) {
+          why = `scale-out +5% (1/3 position)`;
+          sellAmt = (holdingCoins / 3).toFixed(8);
+          cExitCount[sym] = 1;
+
+        // Stale position: held 4+ hours with < 1.5% gain → exit and redeploy
+        } else if (cEntryPrice[sym]) {
+          const ageMs = Date.now() - (cEntryPrice[sym + "_ts"] || Date.now());
+          const ageHrs = ageMs / 3600000;
+          if (ageHrs >= 4 && gp < 1.5) {
+            why = `stale exit — ${ageHrs.toFixed(1)}hr held, only ${gp.toFixed(2)}% gain`;
+            sellAmt = holdingCoins.toFixed(8);
+            cEntryCount[sym] = 0; cExitCount[sym] = 0;
+            delete cEntryPrice[sym];
+            delete cEntryPrice[sym + "_ts"];
+          }
+        }
+
+        // Momentum sell: signal says sell, position is underwater
+        if (!why && sig.type === "SELL" && gp < -2) {
+          why = `momentum sell — ${gp.toFixed(2)}% from entry`;
+          sellAmt = holdingCoins.toFixed(8);
+          cEntryCount[sym] = 0; cExitCount[sym] = 0;
+          delete cEntryPrice[sym];
+          delete cEntryPrice[sym + "_ts"];
+        }
+
+        if (why && sellAmt && parseFloat(sellAmt) * price >= CRYPTO_MIN_TRADE) {
+          const sord = await cbpost("/api/v3/brokerage/orders", {
+            client_order_id: crypto.randomUUID(),
+            product_id: sym,
+            side: "SELL",
+            order_configuration: { market_market_ioc: { base_size: sellAmt } }
+          });
+
+          if (sord?.success) {
+            // P&L based on actual entry price, minus estimated fees
+            const soldCoins  = parseFloat(sellAmt);
+            const grossPnl   = soldCoins * (price - (cEntryPrice[sym] || price));
+            const feeCost    = soldCoins * price * CRYPTO_FEE_PCT;
+            const netPnl     = grossPnl - feeCost;
+            cPnl += netPnl;
+
+            cTrades.unshift({
+              id: sord.success_response?.order_id || Date.now().toString(),
+              symbol: sym, side: "SELL", qty: sellAmt, price,
+              pnl: parseFloat(netPnl.toFixed(2)),
+              entryPrice: cEntryPrice[sym] || null,
+              time: new Date().toLocaleTimeString(),
+              strategy: why, market: "crypto", date: new Date().toISOString()
+            });
+            if (cTrades.length > 100) cTrades.pop();
+            console.log(`[CRYPTO SELL] ${sym} ${sellAmt} @ $${price} | ${why} | Net P&L: $${netPnl.toFixed(2)}`);
+          } else if (sord?.error_response || sord?.error) {
+            console.error(`[CRYPTO SELL FAILED] ${sym}:`, JSON.stringify(sord).substring(0, 200));
+          }
+        }
+      }
+
       // ── CRYPTO BUY ────────────────────────────────────────────────────────
-      // Gate lowered to 65 (was 75). Budget enforced before ordering.
-      if (sig.type === "BUY" && sig.confidence >= 65) {
+      // Confidence gate raised to 70 (was 65). Budget enforced before ordering.
+      if (sig.type === "BUY" && sig.confidence >= 70) {
         if (!cEntryCount[sym]) cEntryCount[sym] = 0;
-        const maxE = sig.confidence >= 85 ? 3 : sig.confidence >= 75 ? 2 : 1;
+        const maxE = sig.confidence >= 85 ? 3 : sig.confidence >= 78 ? 2 : 1;
         if (cEntryCount[sym] >= maxE) continue;
 
         // Hard stop if total crypto budget is exhausted
@@ -551,24 +677,21 @@ async function cryptoTick() {
         }
 
         // Per-symbol cap check
-        const coin          = sym.replace("-USD", "");
-        const holdingCoins  = parseFloat(cbAcc[coin]?.available_balance?.value || 0);
-        const symValue      = holdingCoins * price;
         if (symValue >= CRYPTO_MAX_PER_SYM) {
-          console.log(`[CRYPTO BUY SKIP] ${sym} — per-symbol cap reached ($${symValue.toFixed(2)}/$${CRYPTO_MAX_PER_SYM})`);
+          console.log(`[CRYPTO BUY SKIP] ${sym} — per-symbol cap ($${symValue.toFixed(2)}/$${CRYPTO_MAX_PER_SYM})`);
           continue;
         }
 
-        // Respect actual USD balance too
+        // Respect actual USD balance
         if (usd < CRYPTO_MIN_TRADE) {
-          console.log(`[CRYPTO BUY SKIP] ${sym} — insufficient USD balance ($${usd.toFixed(2)})`);
+          console.log(`[CRYPTO BUY SKIP] ${sym} — insufficient USD ($${usd.toFixed(2)})`);
           continue;
         }
 
-        // Trade size: 10% of remaining available budget, capped at per-symbol room
-        const symRoom      = CRYPTO_MAX_PER_SYM - symValue;
-        const budgetBite   = available * CRYPTO_TRADE_PCT;
-        const budget       = Math.min(budgetBite, symRoom, usd);
+        // Trade size: 15% of remaining budget, capped at per-symbol room and USD balance
+        const symRoom    = CRYPTO_MAX_PER_SYM - symValue;
+        const budgetBite = available * CRYPTO_TRADE_PCT;
+        const budget     = Math.min(budgetBite, symRoom, usd);
 
         if (budget < CRYPTO_MIN_TRADE) continue;
 
@@ -580,75 +703,27 @@ async function cryptoTick() {
         });
 
         if (order?.success) {
+          // Update weighted average entry price
+          const prevAvg     = cEntryPrice[sym] || price;
+          const newEntryAvg = updateEntryPrice(sym, holdingCoins, prevAvg, budget, price);
+          cEntryPrice[sym]       = newEntryAvg;
+          cEntryPrice[sym + "_ts"] = cEntryPrice[sym + "_ts"] || Date.now(); // preserve original entry time
+
           cEntryCount[sym]++;
           cTrades.unshift({
             id: order.success_response?.order_id || Date.now().toString(),
-            symbol: sym, side: "BUY", qty: `$${budget.toFixed(2)}`, price, pnl: null,
+            symbol: sym, side: "BUY",
+            qty: `$${budget.toFixed(2)}`, price,
+            entryPrice: newEntryAvg,
+            pnl: null,
             time: new Date().toLocaleTimeString(),
-            strategy: `Entry ${cEntryCount[sym]}/${maxE} | conf:${sig.confidence}% | budget $${deployed.toFixed(0)}+${budget.toFixed(0)}/$${CRYPTO_MAX_TOTAL}`,
+            strategy: `Entry ${cEntryCount[sym]}/${maxE} | conf:${sig.confidence}% | avg entry $${newEntryAvg.toFixed(2)}`,
             market: "crypto", date: new Date().toISOString()
           });
           if (cTrades.length > 100) cTrades.pop();
-          console.log(`[CRYPTO BUY] ${sym} $${budget.toFixed(2)} @ $${price} | conf:${sig.confidence}% | deployed $${(deployed + budget).toFixed(2)}/$${CRYPTO_MAX_TOTAL}`);
+          console.log(`[CRYPTO BUY] ${sym} $${budget.toFixed(2)} @ $${price} | conf:${sig.confidence}% | avg entry $${newEntryAvg.toFixed(2)} | deployed $${(deployed + budget).toFixed(2)}/$${CRYPTO_MAX_TOTAL}`);
         } else if (order?.error_response || order?.error) {
           console.error(`[CRYPTO BUY FAILED] ${sym}:`, JSON.stringify(order).substring(0, 200));
-        }
-      }
-
-      // ── CRYPTO SELL ───────────────────────────────────────────────────────
-      if (sig.type === "SELL" && sig.confidence >= 65) {
-        const coin    = sym.replace("-USD", "");
-        const holding = parseFloat(cbAcc[coin]?.available_balance?.value || 0);
-        if (holding <= 0) continue;
-        if (!cExitCount[sym]) cExitCount[sym] = 0;
-
-        const oldest = cHist[sym]?.[0] || price;
-        const gp     = ((price - oldest) / oldest) * 100;
-
-        let why = "";
-        let sellAmt = null;
-
-        if (gp <= -15) {
-          why = "stop-loss -15%";
-          sellAmt = holding.toFixed(8);
-          cEntryCount[sym] = 0; cExitCount[sym] = 0;
-        } else if (gp >= 35 && cExitCount[sym] < 3) {
-          why = "target +35% final";
-          sellAmt = holding.toFixed(8);
-          cEntryCount[sym] = 0; cExitCount[sym] = 3;
-        } else if (gp >= 20 && cExitCount[sym] < 2) {
-          why = "scale-out +20%";
-          sellAmt = (holding / 3 * 2).toFixed(8);
-          cExitCount[sym] = 2;
-        } else if (gp >= 10 && cExitCount[sym] < 1) {
-          why = "scale-out +10%";
-          sellAmt = (holding / 3).toFixed(8);
-          cExitCount[sym] = 1;
-        }
-
-        if (!why || !sellAmt) continue;
-        if (parseFloat(sellAmt) * price < 1) continue;
-
-        const sord = await cbpost("/api/v3/brokerage/orders", {
-          client_order_id: crypto.randomUUID(),
-          product_id: sym,
-          side: "SELL",
-          order_configuration: { market_market_ioc: { base_size: sellAmt } }
-        });
-
-        if (sord?.success) {
-          const sp = parseFloat(sellAmt) * price * (gp / 100);
-          cPnl += sp;
-          cTrades.unshift({
-            id: sord.success_response?.order_id || Date.now().toString(),
-            symbol: sym, side: "SELL", qty: sellAmt, price, pnl: parseFloat(sp.toFixed(2)),
-            time: new Date().toLocaleTimeString(),
-            strategy: why, market: "crypto", date: new Date().toISOString()
-          });
-          if (cTrades.length > 100) cTrades.pop();
-          console.log(`[CRYPTO SELL] ${sym} ${sellAmt} | ${why} | P&L: $${sp.toFixed(2)}`);
-        } else if (sord?.error_response || sord?.error) {
-          console.error(`[CRYPTO SELL FAILED] ${sym}:`, JSON.stringify(sord).substring(0, 200));
         }
       }
     }
@@ -707,11 +782,21 @@ app.get("/status", async (req, res) => {
       totalPnL:  parseFloat((sPnl + cPnl).toFixed(2)),
       dailyLossLimit: DAILY_LOSS,
       maxPerStock: MAX_PER_STOCK,
+      cryptoConfig: {
+        maWindow:        20,
+        signalThreshold: "0.25%",
+        confidenceGate:  70,
+        feeBreakeven:    `${CRYPTO_BREAKEVEN.toFixed(2)}%`,
+        universe:        CRYPTO
+      },
       cryptoBudget: {
-        cap:      CRYPTO_MAX_TOTAL,
-        deployed: cryptoBudgetDeployed,
+        cap:       CRYPTO_MAX_TOTAL,
+        deployed:  cryptoBudgetDeployed,
         available: parseFloat((CRYPTO_MAX_TOTAL - cryptoBudgetDeployed).toFixed(2))
       },
+      cryptoEntryPrices: Object.fromEntries(
+        CRYPTO.map(s => [s, cEntryPrice[s] ? parseFloat(cEntryPrice[s].toFixed(2)) : null])
+      ),
       positions
     });
   } catch (e) {
@@ -750,10 +835,14 @@ app.get("/prices", (req, res) => {
     symbol: sym, price: sPrices[sym] || null, histLen: sHist[sym]?.length || 0
   }));
   const cryptoBoard = CRYPTO.map(sym => ({
-    symbol: sym, price: cPrices[sym] || null,
-    histLen: cHist[sym]?.length || 0,
-    // Show warmup progress toward MA7 threshold
-    warmupPct: Math.min(100, Math.round(((cHist[sym]?.length || 0) / 7) * 100))
+    symbol:     sym,
+    price:      cPrices[sym] || null,
+    histLen:    cHist[sym]?.length || 0,
+    warmupPct:  Math.min(100, Math.round(((cHist[sym]?.length || 0) / 20) * 100)),
+    entryPrice: cEntryPrice[sym] ? parseFloat(cEntryPrice[sym].toFixed(2)) : null,
+    entryAge:   cEntryPrice[sym + "_ts"]
+      ? Math.round((Date.now() - cEntryPrice[sym + "_ts"]) / 60000) + "min"
+      : null
   }));
   res.json({
     stocks: stockBoard,
@@ -832,9 +921,9 @@ app.all("/bot/start", (req, res) => {
   }
   if (!cryptoRunning) {
     cryptoRunning = true;
-    cTimer = setInterval(cryptoTick, 10000); // 10s — matches stocks now
+    cTimer = setInterval(cryptoTick, 10000);
     cryptoTick();
-    console.log("[BOT] Crypto bot started (10s interval)");
+    console.log("[BOT] Crypto bot started (10s interval | MA20 | 0.25% threshold)");
   }
   res.json({ ok: true, stockRunning, cryptoRunning });
 });
@@ -866,7 +955,7 @@ app.all("/bot/stop/stocks", (req, res) => {
 app.all("/bot/start/crypto", (req, res) => {
   if (!cryptoRunning) {
     cryptoRunning = true;
-    cTimer = setInterval(cryptoTick, 10000); // 10s
+    cTimer = setInterval(cryptoTick, 10000);
     cryptoTick();
   }
   res.json({ ok: true, cryptoRunning });
@@ -882,7 +971,7 @@ app.get("/cb/products", async (req, res) => {
   try {
     const data = await cbget("/api/v3/brokerage/products?limit=250");
     if (!data.products) return res.json({ raw: data });
-    const cryptoSymbols = ["BTC","ETH","SOL","DOGE","ADA"];
+    const cryptoSymbols = ["BTC","ETH","SOL"];
     const matches = data.products
       .filter(p => cryptoSymbols.some(c => p.product_id.startsWith(c)))
       .map(p => ({ id: p.product_id, price: p.price, status: p.status }));
@@ -897,8 +986,15 @@ app.get("/", (req, res) => res.sendFile(path.join(__dirname, "index.html")));
 // ─── BOOT ─────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log(`[APEX TRADE] Listening on port ${PORT} | PAPER=${PAPER} | MAX_PER_STOCK=$${MAX_PER_STOCK}`);
-  console.log(`[APEX TRADE] Crypto config: MA7 | 0.10% threshold | 65% confidence gate | $${CRYPTO_MAX_TOTAL} budget cap`);
+  console.log(`\n╔══════════════════════════════════════════════════╗`);
+  console.log(`║           APEX TRADE — SERVER STARTED           ║`);
+  console.log(`╠══════════════════════════════════════════════════╣`);
+  console.log(`║  Port: ${PORT}  |  Paper: ${PAPER}                        ║`);
+  console.log(`║  Crypto: MA20 | 0.25% threshold | 70% gate      ║`);
+  console.log(`║  Fee breakeven: ${CRYPTO_BREAKEVEN.toFixed(2)}% per round-trip         ║`);
+  console.log(`║  Universe: ${CRYPTO.join(", ")}              ║`);
+  console.log(`║  Stop-loss: -8% | Targets: +5% / +12% / +20%   ║`);
+  console.log(`╚══════════════════════════════════════════════════╝\n`);
 
   await testCoinbaseAuth();
 
@@ -907,7 +1003,7 @@ app.listen(PORT, async () => {
   stockTick();
 
   cryptoRunning = true;
-  cTimer = setInterval(cryptoTick, 10000); // 10s — was 15s
+  cTimer = setInterval(cryptoTick, 10000);
   cryptoTick();
 
   // Keep Render alive
