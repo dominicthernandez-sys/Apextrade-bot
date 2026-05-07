@@ -855,7 +855,7 @@ app.all("/bot/stop/crypto", (req, res) => {
 });
 app.get("/cb/products", async (req, res) => {
   try {
-    const data = await cbget("/api/v3/brokerage/products?product_type=SPOT&contract_expiry_type=UNKNOWN_CONTRACT_EXPIRY_TYPE");
+    const data = await cbget("/api/v3/brokerage/products?limit=250");
     const crypto = ["BTC","ETH","SOL","DOGE","ADA"];
     const matches = data.products?.filter(p => 
       crypto.some(c => p.product_id.startsWith(c))
