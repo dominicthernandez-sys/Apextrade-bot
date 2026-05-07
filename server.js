@@ -239,7 +239,7 @@ function cbget(p) {
       const text = await r.text();
       try { return JSON.parse(text); }
       catch { 
-        console.error("[CB GET] Non-JSON:", text.substring(0, 100)); 
+        console.error("[CB GET] Non-JSON:", text.substring(0, 500)); 
         return {}; 
       }
     })
@@ -508,7 +508,7 @@ async function cryptoTick() {
           const p  = parseFloat(pb.asks?.[0]?.price || pb.bids?.[0]?.price || 0);
           if (p > 0) { cPrices[pair] = p; addPx(cHist, pair, p); }
         } else if (res && !res.pricebooks) {
-          console.warn("[CB price]", pair, "unexpected response:", JSON.stringify(res).substring(0, 150));
+          console.warn("[CB price]", pair, "unexpected response:", JSON.stringify(res).substring(0, 500));
         }
       } catch (e) {
         console.error("[CB price fetch]", pair, e.message);
