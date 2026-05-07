@@ -491,25 +491,11 @@ async function cryptoTick() {
     // ── Fetch prices via Coinbase best bid/ask ──
     for (const pair of CRYPTO) {
       try {
-        const res = await cbget(`/api/v3/brokerage/products/${pair}`);
-        if (res?.price) {
-          const p = parseFloat(res.price);
-          if (p > 0) { cPrices[pair] = p; addPx(cHist, pair, p); }
-        } else if (res?.mid_market_price) {
-          const p = parseFloat(res.mid_market_price);
-          if (p > 0) { cPrices[pair] = p; addPx(cHist, pair, p); }
-        }
-        if (res?._jwtFailed) {
-          console.warn("[CB price] JWT failed — skipping crypto tick");
-          return;
-        }
-        if (res?.pricebooks?.length > 0) {
-          const pb = res.pricebooks[0];
-          const p  = parseFloat(pb.asks?.[0]?.price || pb.bids?.[0]?.price || 0);
-          if (p > 0) { cPrices[pair] = p; addPx(cHist, pair, p); }
-        } else if (res && !res.pricebooks) {
-          console.warn("[CB price]", pair, "unexpected response:", JSON.stringify(res).substring(0, 500));
-        }
+      const res = await cbget(`/api/v3/brokerage/products/${pair}`);
+      if (res?._jwtFailed) { console.warn("[CB price] JWT failed"); return; }
+      const p = parseFloat(res?.price || res?.mid_market_price || 0);
+      if (p > 0) { cPrices[pair] = p; addPx(cHist, pair, p); }
+      else console.warn("[CB price]", pair, "no price in response");  
       } catch (e) {
         console.error("[CB price fetch]", pair, e.message);
       }
