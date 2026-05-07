@@ -853,7 +853,22 @@ app.all("/bot/stop/crypto", (req, res) => {
   if (cTimer) { clearInterval(cTimer); cTimer = null; }
   res.json({ ok: true, cryptoRunning });
 });
-
+app.get("/cb/products", async (req, res) => {
+  try {
+    const data = await cbget("/api/v3/brokerage/products?product_type=SPOT&contract_expiry_type=UNKNOWN_CONTRACT_EXPIRY_TYPE");
+    const crypto = ["BTC","ETH","SOL","DOGE","ADA"];
+    const matches = data.products?.filter(p => 
+      crypto.some(c => p.product_id.startsWith(c))
+    ).map(p => ({
+      id: p.product_id,
+      price: p.price,
+      status: p.status
+    }));
+    res.json({ matches });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 app.get("/", (req, res) => res.sendFile(path.join(__dirname, "index.html")));
 
 // ─── BOOT ─────────────────────────────────────────────────────────────────────
