@@ -6,16 +6,18 @@ app.use(express.json());
 app.use(express.static(__dirname));
 
 // ════════════════════════════════════════════════════════════════════════════
-//  APEX TRADE v3.2 — MEAN REVERSION ENGINE
+//  APEX TRADE v3.3 — MEAN REVERSION ENGINE
 //  Strategy: RSI(2) oversold + Bollinger Band lower touch → swing long
 //  Hold: 1–5 days on daily bars  |  Exit: price reverts to 20-period MA
-//  Crypto: same logic on 1-hour bars, runs 24/7 independently
 //
-//  FIX v3.2: Stock loss limit check now relies solely on stockLossLimitHit
-//  flag instead of comparing sPnl <= dailyLossLimit. The old comparison
-//  evaluated 0 <= 0 on every fresh boot, instantly pausing the stock bot
-//  before it ever ran. dailyLossLimit is now initialized to -Infinity so
-//  a raw numeric comparison can never accidentally trigger on boot.
+//  Crypto improvements v3.3:
+//  - 6-hour bars instead of 1-hour (higher quality signals, less noise)
+//  - Volume spike filter on entry (1.5x 20-bar average required)
+//  - BTC trend filter — suppresses altcoin entries when BTC < MA20
+//  - RSI entry tightened 15→10, exit widened 75→80
+//  - Tick interval 10min→30min (matches 6hr bar cadence, fewer API calls)
+//  - Time stop corrected: 4 bars × 6hr = 24hr max hold
+//  - Stock loss limit boot bug fixed (v3.2): dailyLossLimit = -Infinity
 // ════════════════════════════════════════════════════════════════════════════
 
 // ─── ENV CONFIG ───────────────────────────────────────────────────────────────
@@ -44,23 +46,19 @@ const STOP_PCT        = 0.05; // 5% hard stop
 const TIME_STOP_BARS  = 5;    // exit after 5 daily bars with no reversion
 
 // ─── CRYPTO PARAMS ────────────────────────────────────────────────────────────
-// Crypto runs 24/7 on 1-hour bars. Thresholds are wider due to crypto volatility.
-const CRYPTO_RSI_ENTRY  = 15;   // more extreme oversold required
-const CRYPTO_RSI_EXIT   = 75;   // exit overbought threshold
-const CRYPTO_STOP_PCT   = 0.08; // 8% stop — crypto needs more room
-const CRYPTO_TIME_BARS  = 12;   // 12 hours max hold with no reversion
-const CRYPTO_MAX_TOTAL  = 100;  // hard budget cap across all crypto
-const CRYPTO_RISK_PCT   = 0.20; // 20% of available budget per signal
-const CRYPTO_FEE_PCT    = 0.006;
-const CRYPTO_BREAKEVEN  = CRYPTO_FEE_PCT * 2 * 100; // 1.2% round-trip cost
-
-// ─── CRYPTO DAILY RESET CONFIG ────────────────────────────────────────────────
-// Crypto has its OWN daily reset that runs at UTC midnight.
-// This is separate from the stock reset (which only runs during market hours).
-// Without this, cPnl never resets and the 30% loss limit never clears — even
-// after a new day begins. The stock bot may be stopped on weekends so it cannot
-// be relied upon to trigger maybeDailyReset for crypto.
-const CRYPTO_RESET_HOUR_UTC = 0; // reset crypto state at midnight UTC
+// Crypto runs 24/7 on 6-hour bars. v3.3: upgraded from 1-hour bars.
+// Coinbase only supports: ONE_MINUTE, FIVE_MINUTE, FIFTEEN_MINUTE,
+// ONE_HOUR, SIX_HOUR, ONE_DAY — there is no FOUR_HOUR option.
+const CRYPTO_GRANULARITY = "SIX_HOUR";   // Coinbase granularity string
+const CRYPTO_RSI_ENTRY   = 10;   // tightened from 15 — only true capitulation
+const CRYPTO_RSI_EXIT    = 80;   // widened from 75 — 6hr bars need more room
+const CRYPTO_STOP_PCT    = 0.08; // 8% hard stop
+const CRYPTO_TIME_BARS   = 4;    // 4 × 6hr = 24hr max hold with no reversion
+const CRYPTO_MAX_TOTAL   = 100;  // hard budget cap across all crypto
+const CRYPTO_RISK_PCT    = 0.20; // 20% of available budget per signal
+const CRYPTO_FEE_PCT     = 0.006;
+const CRYPTO_BREAKEVEN   = CRYPTO_FEE_PCT * 2 * 100; // 1.2% round-trip cost
+const CRYPTO_VOL_MULT    = 1.5;  // volume must be 1.5× 20-bar SMA to enter
 
 // ─── FOCUSED UNIVERSE ────────────────────────────────────────────────────────
 const STOCKS = [
@@ -81,33 +79,30 @@ console.log("[BOOT] Strategy: MEAN REVERSION | RSI(2) + Bollinger Bands + 200MA 
 console.log(`[BOOT] Stock entry: RSI(2) < ${RSI_ENTRY} + below BB lower + above MA(${TREND_MA_PERIOD})`);
 console.log(`[BOOT] Stock exit: MA reversion OR RSI(2) > ${RSI_EXIT} OR -${STOP_PCT*100}% stop OR ${TIME_STOP_BARS}-bar time stop`);
 console.log(`[BOOT] Risk: ${MAX_RISK_PCT*100}% equity/trade | max ${MAX_POSITIONS} positions | ${MAX_DAILY_TRADES} trades/day`);
-console.log(`[BOOT] Crypto: 24/7 | RSI(2) < ${CRYPTO_RSI_ENTRY} + below BB | 1hr bars | resets at UTC midnight`);
+console.log(`[BOOT] Crypto: 24/7 | ${CRYPTO_GRANULARITY} bars | RSI(2) < ${CRYPTO_RSI_ENTRY} + BB + vol spike + BTC trend filter`);
 
 // ─── STATE ────────────────────────────────────────────────────────────────────
 let stockRunning = false, cryptoRunning = false;
 let stockTimer = null, cTimer = null;
 
-// Stock daily reset
+// Stock daily state
 let lastStockResetDay = "";
 let stockLossLimitHit = false;
 let sPnl = 0, sTrades = [], sSigs = [], sPrices = {};
 let sEntryCount = {}, sPositionMeta = {};
 let sDailyTradeCount = 0;
-// FIX: Initialize to -Infinity so a numeric comparison can never
-// accidentally fire on boot when both sPnl and dailyLossLimit are 0.
-// The actual limit is set correctly inside maybeStockDailyReset() once
-// equity is known. Loss limit enforcement now relies on stockLossLimitHit.
+// FIX v3.2: Initialize to -Infinity so 0 <= 0 never fires on boot.
+// The real limit is set inside maybeStockDailyReset() once equity is known.
 let dailyLossLimit = -Infinity;
 let sHistory = {};
 
-// Crypto daily reset — INDEPENDENT of stock bot
+// Crypto state — INDEPENDENT of stock bot
 let lastCryptoResetDay = "";
 let cryptoLossLimitHit = false;
 let cPnl = 0, cTrades = [], cSigs = [], cPrices = {};
 let cHistory = {}, cEntryPrice = {}, cPositionMeta = {};
 
 // ─── STOCK DAILY RESET ────────────────────────────────────────────────────────
-// Only runs during market hours on weekdays. Resets stock-specific state.
 function maybeStockDailyReset(equity) {
   const now      = new Date();
   const day      = now.getUTCDay();
@@ -115,43 +110,35 @@ function maybeStockDailyReset(equity) {
   const min      = now.getUTCMinutes();
   const todayNum = now.toISOString().slice(0, 10);
 
-  if (day === 0 || day === 6) return; // no reset on weekends
-  if (hour < 13 || (hour === 13 && min < 30)) return; // before market open
-  if (lastStockResetDay === todayNum) return; // already reset today
+  if (day === 0 || day === 6) return;
+  if (hour < 13 || (hour === 13 && min < 30)) return;
+  if (lastStockResetDay === todayNum) return;
 
-  lastStockResetDay   = todayNum;
-  sPnl                = 0;
-  sEntryCount         = {};
-  sDailyTradeCount    = 0;
-  stockLossLimitHit   = false;
-  dailyLossLimit      = -Infinity; // reset to safe default until equity is known
+  lastStockResetDay  = todayNum;
+  sPnl               = 0;
+  sEntryCount        = {};
+  sDailyTradeCount   = 0;
+  stockLossLimitHit  = false;
+  dailyLossLimit     = -Infinity; // safe default until equity is confirmed
 
   if (equity > 0) {
     dailyLossLimit = -(equity * DAILY_LOSS_PCT);
     console.log(`[STOCK RESET] Daily loss limit set: $${Math.abs(dailyLossLimit).toFixed(2)} (${DAILY_LOSS_PCT*100}% of $${equity.toFixed(2)})`);
   }
-
   console.log("[STOCK RESET] Daily state reset for", todayNum);
 }
 
 // ─── CRYPTO DAILY RESET ───────────────────────────────────────────────────────
-// Runs at UTC midnight every day — completely independent of the stock bot.
-// This is the key fix that makes crypto truly 24/7: crypto state resets even
-// on weekends and holidays when the stock bot is idle.
+// Runs at UTC midnight, independent of stock bot.
+// Crypto positions are NOT reset here — they can span multiple days.
 function maybeCryptoDailyReset() {
   const now      = new Date();
   const todayNum = now.toISOString().slice(0, 10);
-
-  // Reset at UTC midnight regardless of weekday
   if (lastCryptoResetDay === todayNum) return;
 
-  lastCryptoResetDay  = todayNum;
-  cPnl                = 0;
-  cryptoLossLimitHit  = false;
-  // Note: we deliberately do NOT reset cEntryPrice or cPositionMeta here.
-  // Crypto positions can span multiple days — resetting those mid-hold
-  // would cause the bot to lose track of an active position and never exit it.
-
+  lastCryptoResetDay = todayNum;
+  cPnl               = 0;
+  cryptoLossLimitHit = false;
   console.log(`[CRYPTO RESET] Daily state reset for ${todayNum} | cPnl reset to $0 | loss limit cleared`);
 }
 
@@ -259,9 +246,9 @@ function calcRSI(closes, period) {
   return 100 - (100 / (1 + avgGain / avgLoss));
 }
 
-function calcSMA(closes, period) {
-  if (closes.length < period) return null;
-  return closes.slice(-period).reduce((a, b) => a + b, 0) / period;
+function calcSMA(arr, period) {
+  if (!arr || arr.length < period) return null;
+  return arr.slice(-period).reduce((a, b) => a + b, 0) / period;
 }
 
 function calcBB(closes, period, stdMult) {
@@ -312,7 +299,7 @@ async function fetchDailyBars(symbols, limit = 250) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  MEAN REVERSION SIGNAL ENGINE
+//  MEAN REVERSION SIGNAL ENGINE — STOCKS
 // ═══════════════════════════════════════════════════════════════════════════════
 function getMeanReversionSignal(sym, history, currentPosition) {
   if (!history || history.count < TREND_MA_PERIOD + 5) {
@@ -389,8 +376,8 @@ function getMeanReversionSignal(sym, history, currentPosition) {
     type: null,
     reason: [
       isOversold   ? `✓ RSI(2)=${rsi2.toFixed(1)}<${RSI_ENTRY}` : `✗ RSI(2)=${rsi2.toFixed(1)} (need <${RSI_ENTRY})`,
-      isBelowBB    ? `✓ below BB`     : `✗ above BB lower $${bb.lower.toFixed(2)}`,
-      isAboveTrend ? `✓ above MA200`  : `✗ below MA200 $${ma200.toFixed(2)} — downtrend skip`
+      isBelowBB    ? `✓ below BB`    : `✗ above BB lower $${bb.lower.toFixed(2)}`,
+      isAboveTrend ? `✓ above MA200` : `✗ below MA200 $${ma200.toFixed(2)} — downtrend skip`
     ].join(" | "),
     rsi: rsi2, bb, ma200
   };
@@ -401,8 +388,8 @@ function calcPositionSize(equity, price, stopPrice) {
   const dollarRisk   = equity * MAX_RISK_PCT;
   const riskPerShare = price - stopPrice;
   if (riskPerShare <= 0) return 0;
-  const shares = Math.floor(dollarRisk / riskPerShare);
-  const maxCost = equity * 0.25; // max 25% of equity per position
+  const shares  = Math.floor(dollarRisk / riskPerShare);
+  const maxCost = equity * 0.25;
   return Math.max(1, shares * price > maxCost ? Math.floor(maxCost / price) : shares);
 }
 
@@ -445,20 +432,19 @@ async function stockTick() {
 
     maybeStockDailyReset(equity);
 
-    // FIX: Only check the flag, not sPnl <= dailyLossLimit.
-    // The flag is set inside the loss-limit block below when a real breach
-    // occurs during an active trading day. Comparing raw numbers caused a
-    // 0 <= 0 false positive on every cold boot, instantly killing the bot.
+    // FIX v3.2: Check the flag first — never compare raw numbers on boot.
+    // On a fresh boot both sPnl and dailyLossLimit are 0/-Infinity; the old
+    // code evaluated 0 <= 0 = true and killed the stock bot immediately.
     if (stockLossLimitHit) {
-      console.log(`[STOCKS] Loss limit flag set — pausing stock bot.`);
+      console.log(`[STOCKS] Loss limit flag active — pausing stock bot.`);
       stockRunning = false;
       clearInterval(stockTimer);
       stockTimer = null;
       return;
     }
 
-    // Actual intra-day loss limit enforcement — only triggers after
-    // dailyLossLimit has been set to a real negative value by maybeStockDailyReset.
+    // Real intra-day loss check — only fires after maybeStockDailyReset()
+    // has set dailyLossLimit to a real negative number from live equity.
     if (dailyLossLimit !== -Infinity && sPnl <= dailyLossLimit) {
       console.log(`[STOCKS] Daily loss limit hit ($${sPnl.toFixed(2)} / $${dailyLossLimit.toFixed(2)}). Pausing.`);
       stockLossLimitHit = true;
@@ -508,9 +494,9 @@ async function stockTick() {
           symbol: sym, type: sig.type || "WATCH",
           confidence: sig.confidence || 0,
           reason: sig.reason, price,
-          rsi:         sig.rsi  !== undefined ? parseFloat(sig.rsi.toFixed(1))    : null,
+          rsi:         sig.rsi  !== undefined ? parseFloat(sig.rsi.toFixed(1))      : null,
           bbLower:     sig.bb?.lower           ? parseFloat(sig.bb.lower.toFixed(2)) : null,
-          ma200:       sig.ma200               ? parseFloat(sig.ma200.toFixed(2))   : null,
+          ma200:       sig.ma200               ? parseFloat(sig.ma200.toFixed(2))    : null,
           targetPrice: sig.targetPrice || null,
           rrRatio:     sig.rrRatio || null,
           time: new Date().toLocaleTimeString(), market: "stocks"
@@ -578,22 +564,22 @@ async function stockTick() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  CRYPTO TICK — 10min interval, 24/7, independent reset
+//  CRYPTO TICK — 30min interval, 24/7, independent reset
 //
-//  Key differences from stock tick:
-//  1. No isMarketHours() check — runs at all hours including weekends
-//  2. Calls maybeCryptoDailyReset() directly — not reliant on stock bot
-//  3. Increments barsHeld by checking elapsed hours since entry, not day count
-//     so the time stop works correctly across overnight and weekend holds
-//  4. Loss limit is budget-relative (30% of $100 cap) not equity-relative
+//  v3.3 improvements vs v3.1:
+//  1. SIX_HOUR bars — higher signal quality, far less noise than 1hr
+//  2. Volume spike filter — entry only when vol > 1.5× 20-bar SMA
+//  3. BTC MA20 trend filter — suppresses ETH/SOL entries in BTC downtrend
+//  4. RSI entry 15→10 — only true capitulation signals
+//  5. RSI exit 75→80 — wider exit threshold for 6hr bar swings
+//  6. Tick 10min→30min — matches bar cadence, reduces wasted API calls
+//  7. Time stop: 4 bars × 6hr = 24hr max (was 12 × 1hr = 12hr)
 // ═══════════════════════════════════════════════════════════════════════════════
 async function cryptoTick() {
   if (!cryptoRunning) return;
 
-  // Independent daily reset — runs at UTC midnight regardless of stock bot
   maybeCryptoDailyReset();
 
-  // Check crypto loss limit
   if (cPnl <= -(CRYPTO_MAX_TOTAL * 0.30) || cryptoLossLimitHit) {
     if (!cryptoLossLimitHit) {
       console.log(`[CRYPTO] 30% budget loss limit hit ($${cPnl.toFixed(2)}). Pausing.`);
@@ -606,22 +592,22 @@ async function cryptoTick() {
   }
 
   try {
-    // Fetch 1-hour bars for each pair
+    // ── FETCH 6-HOUR BARS ─────────────────────────────────────────────────────
     for (const pair of CRYPTO) {
       try {
-        const res = await cbget(`/api/v3/brokerage/products/${pair}/candles?granularity=ONE_HOUR&limit=60`);
+        const res = await cbget(`/api/v3/brokerage/products/${pair}/candles?granularity=${CRYPTO_GRANULARITY}&limit=60`);
         if (res?.candles && Array.isArray(res.candles)) {
           const candles = res.candles.slice().reverse(); // CB returns newest first
           const closes  = candles.map(c => parseFloat(c.close));
           const highs   = candles.map(c => parseFloat(c.high));
           const lows    = candles.map(c => parseFloat(c.low));
+          const volumes = candles.map(c => parseFloat(c.volume)); // v3.3: needed for spike filter
           if (closes.length > 0) {
             cPrices[pair]  = closes[closes.length - 1];
-            cHistory[pair] = { closes, highs, lows, count: closes.length };
+            cHistory[pair] = { closes, highs, lows, volumes, count: closes.length };
           }
         }
       } catch(e) {
-        // Fallback: fetch spot price if candles fail
         const res = await cbget(`/api/v3/brokerage/products/${pair}`);
         const p   = parseFloat(res?.price || 0);
         if (p > 0) cPrices[pair] = p;
@@ -634,13 +620,26 @@ async function cryptoTick() {
     if (accRes?.accounts) accRes.accounts.forEach(a => { cbAcc[a.currency] = a; });
     const usdBal = parseFloat(cbAcc["USD"]?.available_balance?.value || 0);
 
-    // Tally deployed budget across all holdings
+    // Tally deployed budget
     let totalDeployed = 0;
     for (const pair of CRYPTO) {
       const coin    = pair.replace("-USD", "");
       const holding = parseFloat(cbAcc[coin]?.available_balance?.value || 0);
       const price   = cPrices[pair] || 0;
       totalDeployed += holding * price;
+    }
+
+    // ── BTC TREND FILTER ─────────────────────────────────────────────────────
+    // Compute once before the pair loop.
+    // If BTC is below its 20-bar MA on 6hr bars, altcoin entries are blocked.
+    // BTC itself is still tradeable — the filter only affects ETH and SOL.
+    // btcUptrend = null means BTC is still warming up — altcoin entries allowed.
+    const btcHistory = cHistory["BTC-USD"];
+    const btcMA20    = btcHistory ? calcSMA(btcHistory.closes, 20) : null;
+    const btcPrice   = cPrices["BTC-USD"] || 0;
+    const btcUptrend = btcMA20 ? btcPrice > btcMA20 : null;
+    if (btcMA20) {
+      console.log(`[CRYPTO] BTC trend: $${btcPrice.toFixed(0)} vs MA20 $${btcMA20.toFixed(0)} — ${btcUptrend ? "✓ uptrend" : "✗ downtrend — altcoin entries suppressed"}`);
     }
 
     cSigs = [];
@@ -653,9 +652,16 @@ async function cryptoTick() {
         continue;
       }
 
-      const rsi  = calcRSI(history.closes.slice(-20), RSI_PERIOD);
-      const bb   = calcBB(history.closes, BB_PERIOD, BB_STD);
+      const rsi = calcRSI(history.closes.slice(-20), RSI_PERIOD);
+      const bb  = calcBB(history.closes, BB_PERIOD, BB_STD);
       if (rsi === null || !bb) continue;
+
+      // ── VOLUME SPIKE FILTER ──────────────────────────────────────────────
+      // Low-volume oversold = drift / noise. High-volume oversold = genuine
+      // capitulation worth fading. Require 1.5× the 20-bar volume average.
+      const volSMA20      = calcSMA(history.volumes, 20);
+      const currentVol    = history.volumes[history.volumes.length - 1];
+      const isVolumeSpike = volSMA20 != null && currentVol > volSMA20 * CRYPTO_VOL_MULT;
 
       const coin         = pair.replace("-USD", "");
       const holdingCoins = parseFloat(cbAcc[coin]?.available_balance?.value || 0);
@@ -664,22 +670,25 @@ async function cryptoTick() {
       const gp           = entryPrice ? ((price - entryPrice) / entryPrice) * 100 : 0;
       const meta         = cPositionMeta[pair] || {};
 
-      // Time stop uses real elapsed hours, not a bar count.
-      // This correctly handles overnight holds and weekend crypto trading.
+      // Time stop uses real elapsed hours — works correctly across days/weekends
       const ageHours = meta.entryTime
         ? (Date.now() - meta.entryTime) / 3600000
         : 0;
 
-      console.log(`[CRYPTO] ${pair} | RSI(2)=${rsi.toFixed(1)} | $${price.toFixed(2)} | BB lower $${bb.lower.toFixed(2)} | holding $${holdingValue.toFixed(2)}${holdingValue > 0 ? ` | ${gp.toFixed(2)}% | ${ageHours.toFixed(1)}hr` : ""}`);
+      console.log(`[CRYPTO] ${pair} | RSI(2)=${rsi.toFixed(1)} | $${price.toFixed(2)} | BB lower $${bb.lower.toFixed(2)} | vol ${currentVol?.toFixed(0)} vs SMA ${volSMA20?.toFixed(0)} (spike:${isVolumeSpike}) | holding $${holdingValue.toFixed(2)}${holdingValue > 0 ? ` | ${gp.toFixed(2)}% | ${ageHours.toFixed(1)}hr` : ""}`);
 
       cSigs.push({
-        symbol: pair, price,
-        rsi:    parseFloat(rsi.toFixed(1)),
-        bbLower:parseFloat(bb.lower.toFixed(2)),
-        bbMid:  parseFloat(bb.mid.toFixed(2)),
-        holding: holdingValue > 0,
-        gainPct: holdingValue > 0 ? parseFloat(gp.toFixed(2)) : null,
-        ageHours: parseFloat(ageHours.toFixed(1)),
+        symbol:       pair, price,
+        rsi:          parseFloat(rsi.toFixed(1)),
+        bbLower:      parseFloat(bb.lower.toFixed(2)),
+        bbMid:        parseFloat(bb.mid.toFixed(2)),
+        volSMA20:     volSMA20 != null ? parseFloat(volSMA20.toFixed(0)) : null,
+        currentVol:   parseFloat((currentVol || 0).toFixed(0)),
+        isVolumeSpike,
+        btcUptrend,
+        holding:      holdingValue > 0,
+        gainPct:      holdingValue > 0 ? parseFloat(gp.toFixed(2)) : null,
+        ageHours:     parseFloat(ageHours.toFixed(1)),
         time: new Date().toLocaleTimeString(), market: "crypto"
       });
 
@@ -687,7 +696,7 @@ async function cryptoTick() {
       if (holdingCoins > 0 && entryPrice) {
         let why = "", sellAmt = null;
 
-        // Profit: mean achieved
+        // Profit: mean reversion complete
         if (price >= bb.mid) {
           why     = `mean achieved — $${price.toFixed(2)} ≥ MA20 ($${bb.mid.toFixed(2)}) | net ~${(gp - CRYPTO_BREAKEVEN).toFixed(2)}% after fees`;
           sellAmt = holdingCoins.toFixed(8);
@@ -702,8 +711,8 @@ async function cryptoTick() {
           why     = `stop-loss ${gp.toFixed(2)}% from entry $${entryPrice.toFixed(2)}`;
           sellAmt = holdingCoins.toFixed(8);
         }
-        // Time stop — based on real elapsed hours
-        if (ageHours >= CRYPTO_TIME_BARS && gp < 1) {
+        // Time stop: 4 bars × 6hr = 24hr
+        if (ageHours >= CRYPTO_TIME_BARS * 6 && gp < 1) {
           why     = `time stop — ${ageHours.toFixed(1)}hr held, only ${gp.toFixed(2)}% gain`;
           sellAmt = holdingCoins.toFixed(8);
         }
@@ -739,7 +748,22 @@ async function cryptoTick() {
       }
 
       // ── CRYPTO ENTRY ──────────────────────────────────────────────────────
+      // All three gates must pass: RSI+BB signal, volume spike, BTC trend.
       if (holdingCoins <= 0 && rsi < CRYPTO_RSI_ENTRY && price <= bb.lower) {
+
+        // Gate 1: Volume spike — reject low-conviction dips
+        if (!isVolumeSpike) {
+          console.log(`[CRYPTO SKIP] ${pair} — signal but no vol spike (${(currentVol || 0).toFixed(0)} < ${(volSMA20 * CRYPTO_VOL_MULT).toFixed(0)} required)`);
+          continue;
+        }
+
+        // Gate 2: BTC trend — block altcoin entries during BTC downtrend
+        // btcUptrend === null means BTC still warming up — allow entry
+        if (pair !== "BTC-USD" && btcUptrend === false) {
+          console.log(`[CRYPTO SKIP] ${pair} — BTC below MA20, altcoin entry blocked`);
+          continue;
+        }
+
         const available = Math.max(0, CRYPTO_MAX_TOTAL - totalDeployed);
         const budget    = Math.min(available * CRYPTO_RISK_PCT, usdBal * 0.9, 40);
 
@@ -756,19 +780,19 @@ async function cryptoTick() {
 
         if (order?.success) {
           cEntryPrice[pair]   = price;
-          cPositionMeta[pair] = { entryTime: Date.now() }; // real timestamp for accurate time stop
-          totalDeployed      += budget; // update tally so next pair sees reduced budget
+          cPositionMeta[pair] = { entryTime: Date.now() };
+          totalDeployed      += budget;
 
           cTrades.unshift({
             id: order.success_response?.order_id || Date.now().toString(),
             symbol: pair, side: "BUY", qty: `$${budget.toFixed(2)}`, price,
             entryPrice: price, pnl: null,
-            reason: `RSI(2)=${rsi.toFixed(1)} below BB lower $${bb.lower.toFixed(2)} | target MA $${bb.mid.toFixed(2)}`,
+            reason: `RSI(2)=${rsi.toFixed(1)} below BB $${bb.lower.toFixed(2)} | vol spike ${(currentVol||0).toFixed(0)} vs SMA ${volSMA20?.toFixed(0)} | BTC trend ✓ | target MA $${bb.mid.toFixed(2)}`,
             time: new Date().toLocaleTimeString(),
             market: "crypto", date: new Date().toISOString()
           });
           if (cTrades.length > 100) cTrades.pop();
-          console.log(`[CRYPTO BUY] ${pair} $${budget.toFixed(2)} @ $${price} | RSI(2)=${rsi.toFixed(1)} | target $${bb.mid.toFixed(2)} | deployed $${totalDeployed.toFixed(2)}/$${CRYPTO_MAX_TOTAL}`);
+          console.log(`[CRYPTO BUY] ${pair} $${budget.toFixed(2)} @ $${price} | RSI(2)=${rsi.toFixed(1)} | vol spike ✓ | BTC trend ✓ | target $${bb.mid.toFixed(2)} | deployed $${totalDeployed.toFixed(2)}/$${CRYPTO_MAX_TOTAL}`);
         } else {
           console.error(`[CRYPTO BUY FAILED] ${pair}:`, JSON.stringify(order).substring(0, 200));
         }
@@ -806,12 +830,14 @@ app.get("/status", async (req, res) => {
       cryptoPnL: parseFloat(cPnl.toFixed(2)),
       totalPnL:  parseFloat((sPnl + cPnl).toFixed(2)),
       strategyInfo: {
-        name:         "Mean Reversion — RSI(2) + Bollinger Bands",
-        entry:        `RSI(2) < ${RSI_ENTRY} AND price below BB(${BB_PERIOD}) AND above MA(${TREND_MA_PERIOD})`,
-        exit:         `MA reversion OR RSI(2) > ${RSI_EXIT} OR -${STOP_PCT*100}% stop OR ${TIME_STOP_BARS}-bar time stop`,
-        riskPerTrade: `${(MAX_RISK_PCT*100).toFixed(0)}% of equity`,
-        maxPositions: MAX_POSITIONS,
-        minRR:        MIN_RR_RATIO
+        name:          "Mean Reversion — RSI(2) + Bollinger Bands",
+        entry:         `RSI(2) < ${RSI_ENTRY} AND price below BB(${BB_PERIOD}) AND above MA(${TREND_MA_PERIOD})`,
+        exit:          `MA reversion OR RSI(2) > ${RSI_EXIT} OR -${STOP_PCT*100}% stop OR ${TIME_STOP_BARS}-bar time stop`,
+        riskPerTrade:  `${(MAX_RISK_PCT*100).toFixed(0)}% of equity`,
+        maxPositions:  MAX_POSITIONS,
+        minRR:         MIN_RR_RATIO,
+        cryptoBars:    CRYPTO_GRANULARITY,
+        cryptoFilters: `RSI(2) < ${CRYPTO_RSI_ENTRY} + BB lower + vol spike ${CRYPTO_VOL_MULT}× + BTC MA20 trend`
       },
       lossLimitStatus: {
         stockLossLimitHit, cryptoLossLimitHit,
@@ -860,38 +886,43 @@ app.get("/prices", (req, res) => {
     const bb    = h ? calcBB(h.closes, BB_PERIOD, BB_STD) : null;
     const ma200 = h ? calcSMA(h.closes, TREND_MA_PERIOD) : null;
     return {
-      symbol:      sym, price,
-      bars:        h?.count || 0,
-      rsi:         rsi  ? parseFloat(rsi.toFixed(1))        : null,
-      bbLower:     bb   ? parseFloat(bb.lower.toFixed(2))   : null,
-      ma200:       ma200? parseFloat(ma200.toFixed(2))       : null,
-      aboveTrend:  price && ma200 ? price > ma200 : null,
-      ready:       (h?.count || 0) >= TREND_MA_PERIOD + 5
+      symbol:     sym, price,
+      bars:       h?.count || 0,
+      rsi:        rsi   ? parseFloat(rsi.toFixed(1))      : null,
+      bbLower:    bb    ? parseFloat(bb.lower.toFixed(2)) : null,
+      ma200:      ma200 ? parseFloat(ma200.toFixed(2))    : null,
+      aboveTrend: price && ma200 ? price > ma200 : null,
+      ready:      (h?.count || 0) >= TREND_MA_PERIOD + 5
     };
   });
   const cryptoBoard = CRYPTO.map(pair => {
-    const h   = cHistory[pair];
-    const rsi = h ? calcRSI(h.closes.slice(-20), RSI_PERIOD) : null;
-    const bb  = h ? calcBB(h.closes, BB_PERIOD, BB_STD) : null;
-    const age = cPositionMeta[pair]?.entryTime
+    const h      = cHistory[pair];
+    const rsi    = h ? calcRSI(h.closes.slice(-20), RSI_PERIOD) : null;
+    const bb     = h ? calcBB(h.closes, BB_PERIOD, BB_STD) : null;
+    const volSMA = h?.volumes ? calcSMA(h.volumes, 20) : null;
+    const curVol = h?.volumes ? h.volumes[h.volumes.length - 1] : null;
+    const age    = cPositionMeta[pair]?.entryTime
       ? parseFloat(((Date.now() - cPositionMeta[pair].entryTime) / 3600000).toFixed(1))
       : null;
     return {
-      symbol:     pair,
-      price:      cPrices[pair] || null,
-      bars:       h?.count || 0,
-      rsi:        rsi ? parseFloat(rsi.toFixed(1))      : null,
-      bbLower:    bb  ? parseFloat(bb.lower.toFixed(2)) : null,
-      bbMid:      bb  ? parseFloat(bb.mid.toFixed(2))   : null,
-      entryPrice: cEntryPrice[pair] || null,
-      ageHours:   age,
-      ready:      (h?.count || 0) >= 30
+      symbol:        pair,
+      price:         cPrices[pair] || null,
+      bars:          h?.count || 0,
+      rsi:           rsi    ? parseFloat(rsi.toFixed(1))      : null,
+      bbLower:       bb     ? parseFloat(bb.lower.toFixed(2)) : null,
+      bbMid:         bb     ? parseFloat(bb.mid.toFixed(2))   : null,
+      volSMA20:      volSMA ? parseFloat(volSMA.toFixed(0))   : null,
+      currentVol:    curVol ? parseFloat(curVol.toFixed(0))   : null,
+      isVolumeSpike: volSMA && curVol ? curVol > volSMA * CRYPTO_VOL_MULT : null,
+      entryPrice:    cEntryPrice[pair] || null,
+      ageHours:      age,
+      ready:         (h?.count || 0) >= 30
     };
   });
   res.json({ stocks: stockBoard, crypto: cryptoBoard });
 });
 
-// Sell routes
+// ─── SELL ROUTES ──────────────────────────────────────────────────────────────
 app.post("/sell/all", async (req, res) => {
   try {
     const posArr = await aget("/v2/positions");
@@ -933,15 +964,15 @@ app.post("/sell/:symbol", async (req, res) => {
   } catch(e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
-// Bot controls
+// ─── BOT CONTROLS ─────────────────────────────────────────────────────────────
 app.all("/bot/start", (req, res) => {
   if (!stockRunning && !stockLossLimitHit) {
     stockRunning = true; stockTimer = setInterval(stockTick, 60000); stockTick();
     console.log("[BOT] Stock bot started");
   }
   if (!cryptoRunning && !cryptoLossLimitHit) {
-    cryptoRunning = true; cTimer = setInterval(cryptoTick, 600000); cryptoTick();
-    console.log("[BOT] Crypto bot started (24/7)");
+    cryptoRunning = true; cTimer = setInterval(cryptoTick, 1800000); cryptoTick();
+    console.log("[BOT] Crypto bot started (24/7 | 30min tick | 6hr bars)");
   }
   res.json({ ok: true, stockRunning, cryptoRunning, stockLossLimitHit, cryptoLossLimitHit });
 });
@@ -960,7 +991,9 @@ app.all("/bot/stop/stocks", (req, res) => {
   res.json({ ok: true, stockRunning });
 });
 app.all("/bot/start/crypto", (req, res) => {
-  if (!cryptoRunning && !cryptoLossLimitHit) { cryptoRunning = true; cTimer = setInterval(cryptoTick, 600000); cryptoTick(); }
+  if (!cryptoRunning && !cryptoLossLimitHit) {
+    cryptoRunning = true; cTimer = setInterval(cryptoTick, 1800000); cryptoTick();
+  }
   res.json({ ok: true, cryptoRunning, cryptoLossLimitHit });
 });
 app.all("/bot/stop/crypto", (req, res) => {
@@ -994,14 +1027,15 @@ app.get("/", (req, res) => res.sendFile(path.join(__dirname, "index.html")));
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
   console.log(`\n╔══════════════════════════════════════════════════════════╗`);
-  console.log(`║        APEX TRADE v3.2 — MEAN REVERSION ENGINE          ║`);
+  console.log(`║        APEX TRADE v3.3 — MEAN REVERSION ENGINE          ║`);
   console.log(`╠══════════════════════════════════════════════════════════╣`);
   console.log(`║  Strategy : RSI(2) + Bollinger Bands + 200MA filter     ║`);
   console.log(`║  Stocks   : 60s tick | market hours only | daily reset  ║`);
-  console.log(`║  Crypto   : 10min tick | 24/7 | UTC midnight reset      ║`);
+  console.log(`║  Crypto   : 30min tick | 24/7 | SIX_HOUR bars          ║`);
+  console.log(`║  Crypto + : vol spike 1.5× | BTC trend | RSI(2) < 10  ║`);
   console.log(`║  Risk     : ${(MAX_RISK_PCT*100).toFixed(0)}% equity/trade | max ${MAX_POSITIONS} pos | ${MAX_DAILY_TRADES} trades/day    ║`);
   console.log(`║  Sizing   : equity-scaled (auto-compounds with account) ║`);
-  console.log(`║  Fix v3.2 : stock loss limit boot bug resolved          ║`);
+  console.log(`║  v3.3     : crypto signal quality overhaul              ║`);
   console.log(`╚══════════════════════════════════════════════════════════╝\n`);
 
   await testCoinbaseAuth();
@@ -1012,10 +1046,10 @@ app.listen(PORT, async () => {
   stockTick();
 
   cryptoRunning = true;
-  cTimer = setInterval(cryptoTick, 600000);
+  cTimer = setInterval(cryptoTick, 1800000); // 30 min — matches 6hr bar cadence
   cryptoTick();
 
-  // Keep Render alive (pings every 10 min)
+  // Keep Render alive — ping every 10 min from within the process
   setInterval(() => {
     fetch("https://apextrade-bot.onrender.com/ping").catch(() => {});
   }, 600000);
@@ -1034,8 +1068,8 @@ app.listen(PORT, async () => {
       if (cryptoLossLimitHit) {
         console.log("[WATCHDOG] Crypto — loss limit hit. Will NOT restart until tomorrow.");
       } else {
-        console.log("[WATCHDOG] Restarting crypto bot (24/7)");
-        cryptoRunning = true; cTimer = setInterval(cryptoTick, 600000); cryptoTick();
+        console.log("[WATCHDOG] Restarting crypto bot (24/7 | 30min tick)");
+        cryptoRunning = true; cTimer = setInterval(cryptoTick, 1800000); cryptoTick();
       }
     }
   }, 3600000);
