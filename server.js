@@ -6,10 +6,16 @@ app.use(express.json());
 app.use(express.static(__dirname));
 
 // ════════════════════════════════════════════════════════════════════════════
-//  APEX TRADE v3.1 — MEAN REVERSION ENGINE
+//  APEX TRADE v3.2 — MEAN REVERSION ENGINE
 //  Strategy: RSI(2) oversold + Bollinger Band lower touch → swing long
 //  Hold: 1–5 days on daily bars  |  Exit: price reverts to 20-period MA
 //  Crypto: same logic on 1-hour bars, runs 24/7 independently
+//
+//  FIX v3.2: Stock loss limit check now relies solely on stockLossLimitHit
+//  flag instead of comparing sPnl <= dailyLossLimit. The old comparison
+//  evaluated 0 <= 0 on every fresh boot, instantly pausing the stock bot
+//  before it ever ran. dailyLossLimit is now initialized to -Infinity so
+//  a raw numeric comparison can never accidentally trigger on boot.
 // ════════════════════════════════════════════════════════════════════════════
 
 // ─── ENV CONFIG ───────────────────────────────────────────────────────────────
@@ -87,7 +93,11 @@ let stockLossLimitHit = false;
 let sPnl = 0, sTrades = [], sSigs = [], sPrices = {};
 let sEntryCount = {}, sPositionMeta = {};
 let sDailyTradeCount = 0;
-let dailyLossLimit = 0;
+// FIX: Initialize to -Infinity so a numeric comparison can never
+// accidentally fire on boot when both sPnl and dailyLossLimit are 0.
+// The actual limit is set correctly inside maybeStockDailyReset() once
+// equity is known. Loss limit enforcement now relies on stockLossLimitHit.
+let dailyLossLimit = -Infinity;
 let sHistory = {};
 
 // Crypto daily reset — INDEPENDENT of stock bot
@@ -114,6 +124,7 @@ function maybeStockDailyReset(equity) {
   sEntryCount         = {};
   sDailyTradeCount    = 0;
   stockLossLimitHit   = false;
+  dailyLossLimit      = -Infinity; // reset to safe default until equity is known
 
   if (equity > 0) {
     dailyLossLimit = -(equity * DAILY_LOSS_PCT);
@@ -434,11 +445,23 @@ async function stockTick() {
 
     maybeStockDailyReset(equity);
 
-    if (sPnl <= dailyLossLimit || stockLossLimitHit) {
-      if (!stockLossLimitHit) {
-        console.log(`[STOCKS] Daily loss limit hit ($${sPnl.toFixed(2)} / $${dailyLossLimit.toFixed(2)}). Pausing.`);
-        stockLossLimitHit = true;
-      }
+    // FIX: Only check the flag, not sPnl <= dailyLossLimit.
+    // The flag is set inside the loss-limit block below when a real breach
+    // occurs during an active trading day. Comparing raw numbers caused a
+    // 0 <= 0 false positive on every cold boot, instantly killing the bot.
+    if (stockLossLimitHit) {
+      console.log(`[STOCKS] Loss limit flag set — pausing stock bot.`);
+      stockRunning = false;
+      clearInterval(stockTimer);
+      stockTimer = null;
+      return;
+    }
+
+    // Actual intra-day loss limit enforcement — only triggers after
+    // dailyLossLimit has been set to a real negative value by maybeStockDailyReset.
+    if (dailyLossLimit !== -Infinity && sPnl <= dailyLossLimit) {
+      console.log(`[STOCKS] Daily loss limit hit ($${sPnl.toFixed(2)} / $${dailyLossLimit.toFixed(2)}). Pausing.`);
+      stockLossLimitHit = true;
       stockRunning = false;
       clearInterval(stockTimer);
       stockTimer = null;
@@ -641,7 +664,7 @@ async function cryptoTick() {
       const gp           = entryPrice ? ((price - entryPrice) / entryPrice) * 100 : 0;
       const meta         = cPositionMeta[pair] || {};
 
-      // ── IMPROVEMENT: Time stop uses real elapsed hours, not a bar count ──
+      // Time stop uses real elapsed hours, not a bar count.
       // This correctly handles overnight holds and weekend crypto trading.
       const ageHours = meta.entryTime
         ? (Date.now() - meta.entryTime) / 3600000
@@ -793,7 +816,7 @@ app.get("/status", async (req, res) => {
       lossLimitStatus: {
         stockLossLimitHit, cryptoLossLimitHit,
         dailyTradesUsed: sDailyTradeCount, dailyTradesCap: MAX_DAILY_TRADES,
-        dailyLossLimit:  parseFloat(dailyLossLimit.toFixed(2)),
+        dailyLossLimit:  dailyLossLimit === -Infinity ? null : parseFloat(dailyLossLimit.toFixed(2)),
         dailyLossUsed:   parseFloat(sPnl.toFixed(2))
       },
       cryptoBudget: {
@@ -971,13 +994,14 @@ app.get("/", (req, res) => res.sendFile(path.join(__dirname, "index.html")));
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
   console.log(`\n╔══════════════════════════════════════════════════════════╗`);
-  console.log(`║        APEX TRADE v3.1 — MEAN REVERSION ENGINE          ║`);
+  console.log(`║        APEX TRADE v3.2 — MEAN REVERSION ENGINE          ║`);
   console.log(`╠══════════════════════════════════════════════════════════╣`);
   console.log(`║  Strategy : RSI(2) + Bollinger Bands + 200MA filter     ║`);
   console.log(`║  Stocks   : 60s tick | market hours only | daily reset  ║`);
   console.log(`║  Crypto   : 10min tick | 24/7 | UTC midnight reset      ║`);
   console.log(`║  Risk     : ${(MAX_RISK_PCT*100).toFixed(0)}% equity/trade | max ${MAX_POSITIONS} pos | ${MAX_DAILY_TRADES} trades/day    ║`);
   console.log(`║  Sizing   : equity-scaled (auto-compounds with account) ║`);
+  console.log(`║  Fix v3.2 : stock loss limit boot bug resolved          ║`);
   console.log(`╚══════════════════════════════════════════════════════════╝\n`);
 
   await testCoinbaseAuth();
